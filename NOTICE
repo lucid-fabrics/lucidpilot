@@ -1,0 +1,51 @@
+This project (LucidPilot) is licensed under the MIT License (see LICENSE).
+
+It also vendors and adapts source code from hermes-chrome-plugin, which is
+separately MIT-licensed by its own authors. The files below retain their
+original MIT license (reproduced at the end of this NOTICE) alongside this
+project's own.
+
+Source repository: https://github.com/waitkeeper/hermes-chrome-plugin
+Vendored commit: 6e152ced0132f4f48ca375cb23f45c34065302ba ("Add privacy policy", 2026-06-23)
+
+Vendored files:
+
+| This project's file | Upstream source |
+|---|---|
+| `bridge.py` | `bridge.py` |
+| `auth.py` | `auth.py` |
+| `commands.py` | `commands.py` |
+| `formatters.py` | `formatters.py` |
+| `chrome_tools.py` | `tools.py` (renamed; `chrome_*` tools renamed to `lp_*`) |
+| `chrome-extension/vendor/control.js` | `chrome-extension/service_worker.js` |
+| `chrome-extension/vendor/snapshot_injected.js` | `chrome-extension/snapshot_injected.js` |
+
+`chrome-extension/vendor/UPSTREAM.md` documents the one intentional
+deviation from upstream (`control.js`'s `BRIDGE_URL` override) and how to
+reapply it on a future re-vendor. All other files above are otherwise
+unmodified or renamed-only ports, as noted in each file's own header
+comment.
+
+---
+
+MIT License
+
+Copyright (c) hermes-chrome-plugin contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "lucidpilot",
+  "description": "Drive your real Chrome from Claude Code with a visible overlay: my_browser_* control tools, indicator_* cosmetics, and the /lp command.",
+  "owner": {
+    "name": "Wassim Mehanna"
+  },
+  "plugins": [
+    {
+      "name": "lucidpilot",
+      "description": "21 my_browser_* browser-control tools and 6 indicator_* overlay tools, all licence-gated, plus /lp for authorize/status/doctor/license - driving the user's real, signed-in Chrome profile.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

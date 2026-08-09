@@ -1,0 +1,52 @@
+name: lucidpilot
+version: "1.0.0"
+description: >-
+  Drives the user's real, signed-in Chrome profile through LucidPilot's own
+  companion Chrome extension over a loopback bridge (port 16329 by default):
+  tabs, accessibility snapshot, navigation, interaction (click/type/fill/
+  key/hover/drag/scroll/tap), file upload, screenshots, and console/network
+  observation via the my_browser_* tools. Locked by default, unlocked with /lp
+  authorize. Also shows a blue/violet border, mouse-like cursor,
+  target-element highlights, and an action toast in that same Chrome while
+  driving it (indicator_* tools, always on, purely cosmetic), plus a local
+  flight-recorder log viewable from the toolbar popup; indicator_* also
+  works standalone for other Chrome surfaces (e.g. hermes-chrome-plugin's
+  chrome_* tools, chrome-devtools-mcp) that don't paint their own overlay.
+  Can run side by side with hermes-chrome-plugin: the control_tools config
+  knob (auto/always/never, see README) skips my_browser_* by default when that
+  plugin is also installed, so the two don't double up on redundant
+  browser-control tools; indicator_* always registers regardless. This
+  plugin's own Chrome extension (bundled in chrome-extension/) must be
+  loaded unpacked once.
+author: Wassim Mehanna
+kind: standalone
+provides_tools:
+  - my_browser_launch
+  - my_browser_tab
+  - my_browser_snapshot
+  - my_browser_find
+  - my_browser_inspect
+  - my_browser_navigate
+  - my_browser_evaluate
+  - my_browser_click
+  - my_browser_type
+  - my_browser_fill
+  - my_browser_key
+  - my_browser_wait_for
+  - my_browser_list_console_messages
+  - my_browser_list_network_requests
+  - my_browser_get_network_request
+  - my_browser_screenshot
+  - my_browser_hover
+  - my_browser_drag
+  - my_browser_tap
+  - my_browser_scroll
+  - my_browser_upload_file
+  - indicator_show
+  - indicator_hide
+  - indicator_move
+  - indicator_click
+  - indicator_type
+  - indicator_scroll
+provides_hooks:
+  - pre_llm_call

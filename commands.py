@@ -1,0 +1,243 @@
+"""The ``/lp`` slash command: Python port of the unified command in
+``pi-chrome/extensions/chrome-profile-bridge/index.ts`` (originally
+``/chrome`` in hermes-chrome-plugin, renamed here to match the my_browser_* tool
+namespace so both plugins' commands don't collide when both are installed).
+
+A single command registered as ``lp`` whose handler parses the first token as
+a subcommand: ``authorize | revoke | status | doctor | onboard | background |
+license``. Handlers return plain strings (the host renders them); there is no
+terminal ``ctx.ui.confirm``: in CLI the act of typing the command is the human
+action; in web-ui an explicit UI confirm precedes the programmatic call.
+"""
+
+from __future__ import annotations
+
+from .auth import ChromeAuth, command_hint
+from .bridge import (
+    ChromeProfileBridge,
+    BridgeError,
+    HERMES_CHROME_VERSION,
+    extension_load_path,
+    extension_version_is_known,
+)
+from . import licensing
+
+
+def _help() -> str:
+    """Built per call, not a module constant: the command's own name differs by
+    host (see auth.command_hint), and printing the wrong one in the help text
+    is exactly how a user ends up typing a command that does not exist."""
+    cmd = command_hint()
+    return f"""\
+{cmd} - control the LucidPilot browser bridge
+
+  {cmd} authorize [30m|<minutes>|8h|indefinite]  Allow Chrome control (8h default, auto-locks after 1h idle).
+  {cmd} revoke                                    Lock Chrome control.
+  {cmd} status                                    One-line: connection, auth, license, background.
+  {cmd} doctor                                    Full health check.
+  {cmd} onboard                                   How to install the companion Chrome extension.
+  {cmd} background [on|off|toggle|status]         Whether my_browser_* switches Chrome to the tab it drives.
+  {cmd} license                                   Where to activate a licence (the extension popup)."""
+
+_BACKGROUND_DESC = {
+    "on": "LucidPilot works quietly; the tab it drives is left where it is.",
+    "off": "Chrome switches to the tab LucidPilot is driving so you can watch. It never raises the Chrome window, so your terminal keeps focus either way.",
+}
+
+
+def _hostname(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+
+        return urlparse(url).hostname or ""
+    except Exception:
+        return ""
+
+
+def _status_summary(bridge: ChromeProfileBridge, auth: ChromeAuth) -> str:
+    parts = []
+    try:
+        version = bridge.send("tab.version", {}, 5_000) or {}
+        ext_version = version.get("extensionVersion")
+        # Only compare when this install actually bundles an extension to
+        # compare against - see bridge.extension_version_is_known.
+        if ext_version and extension_version_is_known() and ext_version != HERMES_CHROME_VERSION:
+            parts.append(f"⚠ Companion extension v{ext_version} (LucidPilot expects v{HERMES_CHROME_VERSION}, reload extension)")
+        else:
+            parts.append("✓ Browser connected")
+    except BridgeError:
+        parts.append("✗ Browser not responding")
+    parts.append(f"auth: {auth.summary()}")
+    parts.append(f"license: {licensing.license_status_summary()}")
+    parts.append(f"background: {'on' if bridge.background_default else 'off'}")
+    return " · ".join(parts)
+
+
+def _doctor(bridge: ChromeProfileBridge, auth: ChromeAuth) -> str:
+    # "LucidPilot v0.0.0-dev" is a lie on a Hermes zip install (the version is
+    # simply not knowable there - no bundled extension to read it from), so
+    # say that instead of printing a version nobody shipped.
+    lines = [f"LucidPilot v{HERMES_CHROME_VERSION}" if extension_version_is_known() else "LucidPilot"]
+    status = bridge.status()
+    role = "sharing another session's connection" if status.get("mode") == "client" else "running the Chrome connection for this machine"
+    lines.append(f"• This session is {role}.")
+
+    # Same auth.is_authorized()/auth.summary() the popup's health panel reads
+    # off GET /status (bridge.py's status() calls these through the same
+    # ChromeAuth instance) - one source, so doctor and the popup can't
+    # disagree about whether Chrome control is currently locked.
+    if auth.is_authorized():
+        lines.append(f"✓ Browser control: {auth.summary()}.")
+    else:
+        lines.append(
+            f"✗ Browser control is locked. Run {command_hint('authorize')} "
+            "(or authorize from the extension popup) before using my_browser_* tools."
+        )
+
+    if licensing.is_pro_licensed():
+        lines.append(f"✓ License: {licensing.license_status_summary()}")
+    else:
+        # license_status_summary already names the cause (extension silent vs
+        # no key activated); only the fix hint differs.
+        lines.append(
+            f"✗ License: {licensing.license_status_summary()}. "
+            f"Enter your key in the LucidPilot extension popup; subscribe at {licensing.PURCHASE_URL} if you don't have one."
+        )
+
+    extension_alive = False
+    version_mismatch = False
+    try:
+        import time as _time
+
+        started = _time.time()
+        version = bridge.send("tab.version", {}, 35_000) or {}
+        latency_ms = round((_time.time() - started) * 1000)
+        extension_alive = True
+        ext_version = version.get("extensionVersion")
+        if ext_version and extension_version_is_known() and ext_version != HERMES_CHROME_VERSION:
+            version_mismatch = True
+            lines += [
+                f"✗ The companion extension is on an old version ({ext_version}); this LucidPilot is {HERMES_CHROME_VERSION}.",
+                "  Fix: open chrome://extensions and click the refresh icon on the LucidPilot extension.",
+            ]
+        else:
+            lines.append(f"✓ Your browser is connected (companion extension v{ext_version or '?'}, responded in {latency_ms}ms).")
+    except BridgeError as exc:
+        lines.append(f"✗ Your browser isn't responding: {exc}")
+        lines.append("  Fix: run /lp onboard to install the companion extension, then keep that browser window open.")
+
+    if extension_alive and not version_mismatch:
+        try:
+            value = bridge.send("page.evaluate", {"expression": "1+1", "awaitPromise": True, "foreground": False}, 10_000)
+            if value == 2:
+                lines.append("✓ LucidPilot can run code in the active tab.")
+            else:
+                lines.append(f"⚠ LucidPilot ran code but got an unexpected result ({value}). The current tab may be a browser internal page or a strict site.")
+        except BridgeError as exc:
+            lines.append(f"✗ LucidPilot can't run code in the active tab: {exc}")
+        try:
+            probe = bridge.send("page.probe", {"foreground": False}, 10_000) or {}
+            if probe.get("arithmetic") == 2:
+                lines.append(f"✓ The active tab is {_hostname(str(probe.get('location')))} and accepts LucidPilot's commands.")
+            if probe.get("webdriver"):
+                lines.append("⚠ Your browser is reporting itself as automated to websites. Some sites use this signal to block sign-ins.")
+        except BridgeError as exc:
+            lines.append(f"⚠ Couldn't inspect the active tab: {exc}")
+    elif version_mismatch:
+        lines.append("… Skipped the remaining checks until you reload the companion extension.")
+
+    return "\n".join(lines)
+
+
+def _onboard() -> str:
+    ext_path = extension_load_path()
+    if ext_path is None:
+        return (
+            "The companion Chrome extension isn't built in this install (chrome-extension/dist is missing).\n"
+            "Get a loadable copy first, either way works:\n"
+            "  - Download lucidpilot-chrome-extension.zip from the LucidPilot releases page and unzip it, or\n"
+            "  - Run `npm ci && npm run build` in a LucidPilot checkout to produce chrome-extension/dist.\n"
+            "Then: open chrome://extensions, turn on Developer mode, click 'Load unpacked',\n"
+            f"choose that folder, keep Chrome open, and run {command_hint('doctor')} to confirm."
+        )
+    return (
+        "Install the LucidPilot companion extension in your normal Chrome profile:\n"
+        "  1. Open chrome://extensions\n"
+        "  2. Turn on 'Developer mode' (top-right).\n"
+        "  3. Click 'Load unpacked' and choose this folder:\n"
+        f"     {ext_path}\n"
+        f"  4. Keep that browser window open, then run {command_hint('doctor')} to confirm."
+    )
+
+
+def _license(key: str) -> str:
+    # Kept as a subcommand so old muscle memory gets an explanation, not
+    # "unknown command". Keys are never entered here anymore - the extension
+    # popup is the single activation point, and it reports the licence back
+    # over the bridge on its own.
+    if (key or "").strip():
+        return (
+            "[lucidpilot] Licence keys are no longer entered here. Open the LucidPilot "
+            "Chrome extension popup and enter your key there - this session "
+            "picks the licence up automatically within seconds. "
+            f"Current state: {licensing.license_status_summary()}."
+        )
+    return (
+        "Licences are activated in the LucidPilot Chrome extension popup (click "
+        "the extension icon, enter your key). Subscribe at "
+        f"{licensing.PURCHASE_URL} if you don't have one. "
+        f"Current state: {licensing.license_status_summary()}."
+    )
+
+
+def _background(bridge: ChromeProfileBridge, arg: str) -> str:
+    arg = (arg or "").strip().lower()
+    current = "on" if bridge.background_default else "off"
+    if arg == "status":
+        return f"Run in background is {current}. {_BACKGROUND_DESC[current]}"
+    if arg in ("on", "true", "1"):
+        bridge.background_default = True
+    elif arg in ("off", "false", "0"):
+        bridge.background_default = False
+    elif arg in ("toggle", ""):
+        bridge.background_default = not bridge.background_default
+    else:
+        return f"Unknown background setting '{arg}'. Pick one of: on | off | toggle | status."
+    nxt = "on" if bridge.background_default else "off"
+    return f"Run in background → {nxt}. {_BACKGROUND_DESC[nxt]}"
+
+
+def register_all_commands(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> None:
+    def handler(raw_args: str) -> str:
+        tokens = (raw_args or "").strip().split()
+        if not tokens or tokens[0] in ("help", "-h", "--help"):
+            return _help()
+        sub, rest = tokens[0], " ".join(tokens[1:])
+        try:
+            if sub == "authorize":
+                return auth.authorize(rest or None)
+            if sub == "revoke":
+                return auth.revoke()
+            if sub == "status":
+                return _status_summary(bridge, auth)
+            if sub == "doctor":
+                return _doctor(bridge, auth)
+            if sub == "onboard":
+                return _onboard()
+            if sub == "background":
+                return _background(bridge, rest)
+            if sub == "license":
+                return _license(rest)
+        except Exception as exc:  # noqa: BLE001
+            return f"[lucidpilot] {type(exc).__name__}: {exc}"
+        return (
+            f"Unknown subcommand '{sub}'. Try: {command_hint()} "
+            "authorize | revoke | status | doctor | onboard | background | license."
+        )
+
+    ctx.register_command(
+        "lp",
+        handler=handler,
+        description="Control the LucidPilot browser bridge (authorize/revoke/status/doctor/onboard/background).",
+        args_hint="authorize|revoke|status|doctor|onboard|background",
+    )
