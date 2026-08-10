@@ -17,10 +17,12 @@ from .bridge import (
     ChromeProfileBridge,
     BridgeError,
     HERMES_CHROME_VERSION,
+    CHROME_WEB_STORE_URL,
     extension_load_path,
     extension_version_is_known,
 )
 from . import licensing
+from . import redirect_policy
 
 
 def _help() -> str:
@@ -37,11 +39,17 @@ def _help() -> str:
   {cmd} doctor                                    Full health check.
   {cmd} onboard                                   How to install the companion Chrome extension.
   {cmd} background [on|off|toggle|status]         Whether my_browser_* switches Chrome to the tab it drives.
+  {cmd} default [on|off|status]                   Whether rival browser tools redirect to my_browser_* when it's ready.
   {cmd} license                                   Where to activate a licence (the extension popup)."""
 
 _BACKGROUND_DESC = {
     "on": "LucidPilot works quietly; the tab it drives is left where it is.",
     "off": "Chrome switches to the tab LucidPilot is driving so you can watch. It never raises the Chrome window, so your terminal keeps focus either way.",
+}
+
+_DEFAULT_DESC = {
+    "on": "Rival browser tools (claude-in-chrome, chrome-devtools, hermes-chrome-plugin) are denied in favor of my_browser_* whenever it's licensed, authorized, and connected.",
+    "off": "Rival browser tools are left alone; my_browser_* only runs when explicitly called.",
 }
 
 
@@ -70,6 +78,7 @@ def _status_summary(bridge: ChromeProfileBridge, auth: ChromeAuth) -> str:
     parts.append(f"auth: {auth.summary()}")
     parts.append(f"license: {licensing.license_status_summary()}")
     parts.append(f"background: {'on' if bridge.background_default else 'off'}")
+    parts.append(f"default: {'on' if redirect_policy.is_enabled() else 'off'}")
     return " · ".join(parts)
 
 
@@ -153,12 +162,11 @@ def _onboard() -> str:
     ext_path = extension_load_path()
     if ext_path is None:
         return (
-            "The companion Chrome extension isn't built in this install (chrome-extension/dist is missing).\n"
-            "Get a loadable copy first, either way works:\n"
-            "  - Download lucidpilot-chrome-extension.zip from the LucidPilot releases page and unzip it, or\n"
-            "  - Run `npm ci && npm run build` in a LucidPilot checkout to produce chrome-extension/dist.\n"
-            "Then: open chrome://extensions, turn on Developer mode, click 'Load unpacked',\n"
-            f"choose that folder, keep Chrome open, and run {command_hint('doctor')} to confirm."
+            "Install the companion Chrome extension from the Chrome Web Store:\n"
+            f"  {CHROME_WEB_STORE_URL}\n"
+            "New listings can sit in Google's review queue for a couple of weeks before\n"
+            "they go live - if the link 404s or shows 'pending', that's why, not a broken link.\n"
+            f"Once installed, keep that browser window open and run {command_hint('doctor')} to confirm."
         )
     return (
         "Install the LucidPilot companion extension in your normal Chrome profile:\n"
@@ -207,6 +215,23 @@ def _background(bridge: ChromeProfileBridge, arg: str) -> str:
     return f"Run in background → {nxt}. {_BACKGROUND_DESC[nxt]}"
 
 
+def _default(arg: str) -> str:
+    arg = (arg or "").strip().lower()
+    current = "on" if redirect_policy.is_enabled() else "off"
+    if arg == "status":
+        return f"Redirect is {current}. {_DEFAULT_DESC[current]}"
+    if arg in ("on", "true", "1"):
+        redirect_policy.set_enabled(True)
+    elif arg in ("off", "false", "0"):
+        redirect_policy.set_enabled(False)
+    elif arg in ("toggle", ""):
+        redirect_policy.set_enabled(not redirect_policy.is_enabled())
+    else:
+        return f"Unknown default setting '{arg}'. Pick one of: on | off | toggle | status."
+    nxt = "on" if redirect_policy.is_enabled() else "off"
+    return f"Redirect → {nxt}. {_DEFAULT_DESC[nxt]}"
+
+
 def register_all_commands(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> None:
     def handler(raw_args: str) -> str:
         tokens = (raw_args or "").strip().split()
@@ -226,18 +251,20 @@ def register_all_commands(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) ->
                 return _onboard()
             if sub == "background":
                 return _background(bridge, rest)
+            if sub == "default":
+                return _default(rest)
             if sub == "license":
                 return _license(rest)
         except Exception as exc:  # noqa: BLE001
             return f"[lucidpilot] {type(exc).__name__}: {exc}"
         return (
             f"Unknown subcommand '{sub}'. Try: {command_hint()} "
-            "authorize | revoke | status | doctor | onboard | background | license."
+            "authorize | revoke | status | doctor | onboard | background | default | license."
         )
 
     ctx.register_command(
         "lp",
         handler=handler,
-        description="Control the LucidPilot browser bridge (authorize/revoke/status/doctor/onboard/background).",
-        args_hint="authorize|revoke|status|doctor|onboard|background",
+        description="Control the LucidPilot browser bridge (authorize/revoke/status/doctor/onboard/background/default).",
+        args_hint="authorize|revoke|status|doctor|onboard|background|default",
     )

@@ -1,6 +1,6 @@
 ---
-description: Control the LucidPilot browser bridge (authorize/revoke/status/doctor/onboard/background/license)
-argument-hint: authorize [8h|30m|yolo]|revoke|status|doctor|onboard|background|license <key>
+description: Control the LucidPilot browser bridge (authorize/revoke/status/doctor/onboard/background/default/license)
+argument-hint: authorize [8h|30m|yolo]|revoke|status|doctor|onboard|background|default [on|off]|license <key>
 disable-model-invocation: true
 allowed-tools:
   - mcp__plugin_lucidpilot_lucidpilot__lp_command

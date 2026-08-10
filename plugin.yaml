@@ -1,5 +1,5 @@
 name: lucidpilot
-version: "1.0.0"
+version: "1.1.0"
 description: >-
   Drives the user's real, signed-in Chrome profile through LucidPilot's own
   companion Chrome extension over a loopback bridge (port 16329 by default):
@@ -15,9 +15,9 @@ description: >-
   Can run side by side with hermes-chrome-plugin: the control_tools config
   knob (auto/always/never, see README) skips my_browser_* by default when that
   plugin is also installed, so the two don't double up on redundant
-  browser-control tools; indicator_* always registers regardless. This
-  plugin's own Chrome extension (bundled in chrome-extension/) must be
-  loaded unpacked once.
+  browser-control tools; indicator_* always registers regardless. The
+  companion Chrome extension installs from the Chrome Web Store, not from
+  this plugin's own files.
 author: Wassim Mehanna
 kind: standalone
 provides_tools:
@@ -50,3 +50,4 @@ provides_tools:
   - indicator_scroll
 provides_hooks:
   - pre_llm_call
+  - pre_tool_call

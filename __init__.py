@@ -81,7 +81,7 @@ _CONTROL_PRIMER = """\
 <lucidpilot>
 Browser control is available through the my_browser_* tools via LucidPilot's own companion Chrome extension running in the user's normal, signed-in Chrome profile (real cookies/sessions; no remote-debug port, no throwaway profile).
 
-When to reach for my_browser_* first, ahead of any other browser tool (chrome_*, mcp__chrome*, Playwright, plain HTTP fetch): anything that needs THE USER'S OWN browser - a site they are signed in to, their cookies or session, a tab they already have open, or an action they should be able to watch happen. Those tools drive a different browser (or none), so on a logged-in site they land on a sign-in wall while my_browser_* is already through it.
+When to reach for my_browser_* first, ahead of any other browser tool (chrome_*, mcp__chrome*, Playwright, plain HTTP fetch): anything that needs THE USER'S OWN browser - a site they are signed in to, their cookies or session, a tab they already have open, or an action they should be able to watch happen. This includes localhost/local dev URLs (e.g. "visit http://localhost:4300") - a dev server only exists on the user's machine, so previewing it is squarely their browser, not a fetch target. Those tools drive a different browser (or none), so on a logged-in site they land on a sign-in wall while my_browser_* is already through it.
 
 Most web work is NOT a browser task, and my_browser_* is the wrong reflex for it. A research question - "how do people do X", "what's the best way to Y", anything answerable from public pages - belongs to the web search/extract tools; they read many sources in the time one browser drives to one. Fetching a single public page's text is likewise cheaper without a browser, and scraping something that must not touch the user's session belongs in a sandboxed browser. Reach for my_browser_* when the task needs THEIR browser, not for every URL.
 
@@ -152,11 +152,13 @@ def register(ctx) -> None:
     register_control = mode == "always" or (mode == "auto" and not _other_chrome_plugin_installed())
 
     auth = None
+    bridge = None
     registered = False
     try:
         import atexit
 
-        from .auth import ChromeAuth
+        from . import licensing, redirect_policy
+        from .auth import ChromeAuth, command_hint
         from .bridge import ChromeProfileBridge
         from .chrome_tools import register_all_tools as _register_browser_tools
         from .commands import register_all_commands
@@ -220,6 +222,30 @@ def register(ctx) -> None:
         return {"context": "\n\n".join(parts)}
 
     ctx.register_hook("pre_llm_call", _inject_primer)
+
+    # Redirect: hermes-chrome-plugin's chrome_* tools duplicate my_browser_*
+    # almost tool-for-tool (see this module's docstring), so when both are
+    # actually registered together - only under control_tools="always", since
+    # "auto" already avoids the double-registration below - a chrome_* call
+    # is denied in favor of the my_browser_* equivalent, but only when
+    # my_browser_* would actually work right now (licensed, authorized,
+    # extension connected). Same gate condition as pretooluse_hook.py's
+    # Claude Code side, just checked in-process instead of over HTTP.
+    if bridge is not None and auth is not None:
+
+        def _redirect_rival_tool(tool_name: str = "", **_kw):
+            if tool_name not in redirect_policy.REDIRECT_TOOLS_HERMES:
+                return None
+            if not redirect_policy.is_enabled():
+                return None
+            if not (licensing.is_pro_licensed() and auth.is_authorized() and bridge.connected):
+                return None
+            return {
+                "action": "block",
+                "message": redirect_policy.block_message(tool_name, command_hint()),
+            }
+
+        ctx.register_hook("pre_tool_call", _redirect_rival_tool)
 
 
 if __name__ == "__main__":

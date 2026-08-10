@@ -18,7 +18,7 @@
 <p align="center">
   <img alt="Licence" src="https://img.shields.io/badge/code-MIT-green">
   <img alt="Chrome Web Store" src="https://img.shields.io/badge/Chrome_Web_Store-in_review-orange">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.0.0-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.1.0-blue">
   <img alt="Works with" src="https://img.shields.io/badge/works_with-Claude_Code_·_Hermes-8A2BE2">
 </p>
 
@@ -74,6 +74,12 @@ hermes gateway restart
 
 Requires `python3` on PATH and nothing else - no pip packages.
 
+Both commands install straight from
+[GitHub releases](https://github.com/lucid-fabrics/lucidpilot/releases) -
+each tag publishes the two plugin zips plus `SHA256SUMS` there for an offline
+or air-gapped install. That repo ships the plugins only: the Chrome extension
+itself is Chrome-Web-Store-only, never bundled into a plugin download.
+
 > **You'll know it worked** when you restart your agent and `/lp status`
 > (Claude Code namespaces it as `/lucidpilot:lp`, autocomplete finds it from
 > `/lp`) reports the extension connected.
@@ -108,6 +114,18 @@ Setting the env var IS the human consent (same power-user opt-out as
 an ordinary grant - hard cap and idle lock still apply unless `indefinite` -
 and it never extends a window that is already running.
 
+### Making LucidPilot the default browser tool
+
+Once authorized, LucidPilot steps in front of rival browser tools
+(claude-in-chrome, chrome-devtools, hermes-chrome-plugin's chrome_*) so your
+agent drives your real Chrome instead of a separate, signed-out one. This is
+on by default. To turn it off:
+
+```
+/lp default off  # leave rival browser tools alone
+/lp default on   # back to redirecting them to my_browser_*
+```
+
 ## What you get
 
 One licence unlocks everything - both halves, both integrations.
@@ -134,12 +152,20 @@ checkout and a daily licence check
 - **One command ends it.** `/lp revoke` locks the tools instantly, mid-session.
 - **The log is written by the extension.** A page can fake the overlay. It
   cannot fake the log.
+- **A submit/buy/pay click pauses for you first.** Clicking something that
+  resolves to a submit button, or a label like "Buy Now", "Place Order",
+  "Pay Now", or "Checkout", shows an on-page approve/deny prompt before the
+  click fires - not just an overlay you watch, one that can stop the click.
+  It denies by default: click Deny, or don't answer, and nothing happens.
 
 ### What it does not do
 
 The parts a demo will not tell you:
 
-- It cannot stop an agent. The overlay is a window, not a lock.
+- The overlay itself cannot stop an agent - it's a window, not a lock. The
+  submit/buy/pay pause above is the one real exception, and only when the
+  agent resolved a specific element (a selector or a snapshot uid); a bare
+  coordinate click skips it.
 - Sensitive domains are a build-time list, not a settings screen.
 - Chrome on the desktop only. No Edge, no Brave, no mobile.
 - It drives the browser you are signed into. That is the point, and the risk.
@@ -173,6 +199,11 @@ looks installed, so one session doesn't end up with two near-identical sets
 of browser-control tools. `indicator_*` always registers regardless, it's
 cosmetic and has nothing to double up on.
 
+With `always`, both tool sets register at once. When that happens, LucidPilot
+denies `chrome_*` calls in favor of `my_browser_*` under the same conditions
+as the "default browser tool" behavior above (licensed, authorized,
+connected) - `/lp default off` turns it off here too.
+
 </details>
 
 <details>
@@ -194,6 +225,9 @@ chrome_tools.py       the 21 my_browser_* tool handlers (gated on auth + license
 indicator_tools.py    the 6 indicator_* tools (cosmetic, licence-gated)
 commands.py           the /lp slash command
 mcp_server.py         MCP stdio server: the same tools + /lp for Claude Code
+redirect_policy.py    shared policy: which rival tools redirect to
+                     my_browser_*, and the /lp default on|off preference
+pretooluse_hook.py    Claude Code's PreToolUse hook entry point (Claude Code only)
 plugin.yaml, __init__.py   Hermes plugin entry point (repo root)
 ```
 

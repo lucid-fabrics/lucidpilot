@@ -1,13 +1,2 @@
 __pycache__/
 *.pyc
-dist/
-.DS_Store
-node_modules/
-tests/e2e/.test-results/
-# Playwright writes failure artifacts here when a run is started from the repo
-# root rather than through the config's outputDir.
-test-results/
-playwright-report/
-.wrangler/
-# Local design comparison harness, never deployed (beeside precedent).
-tools/design-lab/

@@ -161,6 +161,12 @@ _DEV_EXTENSION_ID = "bjgfoabbfphcjlklnonbladkdoljcgel"
 # this origin instead of the dev id above.
 _STORE_EXTENSION_ID = "bfebfknclgjglelmlocldhnjkpngelfl"
 
+# The Chrome Web Store is the only extension distribution channel (no zip,
+# no unpacked-from-a-plugin-install) - commands.py/_onboard and
+# chrome_tools.py/my_browser_launch both point here when no built
+# chrome-extension/dist exists locally to load unpacked instead.
+CHROME_WEB_STORE_URL = f"https://chromewebstore.google.com/detail/{_STORE_EXTENSION_ID}"
+
 
 def _allowed_extension_ids() -> frozenset[str]:
     """The pinned ids above, plus any extra ids from LUCIDPILOT_EXTENSION_IDS.
@@ -614,6 +620,17 @@ class ChromeProfileBridge:
             # including the popup, compare it against the extension's own
             # chrome.runtime.getManifest().version without a round trip.
             "version": HERMES_CHROME_VERSION,
+            # False when `version` above is UNKNOWN_EXTENSION_VERSION
+            # ("0.0.0-dev") - the normal case for a Hermes-plugin-zip install,
+            # which ships the Python side only, no bundled extension to read a
+            # real number from. A caller that compares `version` against its
+            # own real version WITHOUT checking this first nags a perfectly
+            # current install to "restart your agent" forever - see
+            # extension_version_is_known's own docstring. Exposed explicitly
+            # so every caller (this endpoint has more than one - see
+            # popup.ts, commands.py) checks the same flag instead of each
+            # re-deriving it from the sentinel string.
+            "versionKnown": extension_version_is_known(),
             "authorized": self.auth.is_authorized() if self.auth else False,
             "authSummary": self.auth.summary() if self.auth else "locked",
             # Raw grant deadline (epoch s | "indefinite" | null) so the popup
@@ -879,10 +896,11 @@ class _Handler(BaseHTTPRequestHandler):
         return self.rfile.read(length).decode("utf-8") if length else ""
 
     def do_OPTIONS(self) -> None:  # noqa: N802
+        cors = _cors_headers_for(self.headers)
         if not _is_browser_origin_allowed(self.headers):
-            self._send_json(403, {"ok": False, "error": "browser origin not allowed"})
+            self._send_json(403, {"ok": False, "error": "browser origin not allowed"}, cors)
             return
-        self._send_json(200, {"ok": True}, _cors_headers_for(self.headers))
+        self._send_json(200, {"ok": True}, cors)
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -895,7 +913,7 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/next":
             self._handle_next()
             return
-        self._send_json(404, {"error": "not found"})
+        self._send_json(404, {"error": "not found"}, _cors_headers_for(self.headers))
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
@@ -911,27 +929,35 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/assert-license":
             self._handle_assert_license()
             return
-        self._send_json(404, {"error": "not found"})
+        self._send_json(404, {"error": "not found"}, _cors_headers_for(self.headers))
 
     # -- endpoints ---------------------------------------------------------
 
     def _handle_status(self) -> None:
+        # cors computed unconditionally, before the check: a browser that
+        # fails CORS on a response has no way to read the body OR the status
+        # code, so a 403 sent without these headers doesn't read as "denied",
+        # it reads as "server unreachable" - the exact failure mode this bug
+        # produced (see popup.ts's collectDiagnostics catching it as
+        # bridgeError instead of the real "origin not allowed" reason).
+        cors = _cors_headers_for(self.headers)
         if not _is_browser_origin_allowed(self.headers):
-            self._send_json(403, {"ok": False, "error": "browser origin not allowed"})
+            self._send_json(403, {"ok": False, "error": "browser origin not allowed"}, cors)
             return
-        self._send_json(200, self._bridge.status(), _cors_headers_for(self.headers))
+        self._send_json(200, self._bridge.status(), cors)
 
     def _handle_testdrive(self) -> None:
+        cors = _cors_headers_for(self.headers)
         if not _is_browser_origin_allowed(self.headers):
-            self._send_json(403, {"ok": False, "error": "browser origin not allowed"})
+            self._send_json(403, {"ok": False, "error": "browser origin not allowed"}, cors)
             return
         try:
             with open(_TESTDRIVE_FIXTURE_PATH, encoding="utf-8") as fh:
                 html = fh.read()
         except OSError:
-            self._send_json(404, {"ok": False, "error": "testdrive fixture missing"})
+            self._send_json(404, {"ok": False, "error": "testdrive fixture missing"}, cors)
             return
-        self._send_html(200, html, _cors_headers_for(self.headers))
+        self._send_html(200, html, cors)
 
     def _handle_command(self) -> None:
         if not _is_local_process_request(self.headers):
@@ -960,7 +986,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _handle_next(self) -> None:
         if not _is_browser_origin_allowed(self.headers):
-            self._send_json(403, {"ok": False, "error": "browser origin not allowed"})
+            self._send_json(403, {"ok": False, "error": "browser origin not allowed"}, _cors_headers_for(self.headers))
             return
         qs = parse_qs(urlparse(self.path).query)
         self._bridge._mark_seen((qs.get("name") or [None])[0])
@@ -989,7 +1015,7 @@ class _Handler(BaseHTTPRequestHandler):
         # extension). Non-GET requests always carry Origin, so the pin holds.
         origin = self.headers.get("origin") or ""
         if origin not in _ALLOWED_EXTENSION_ORIGINS:
-            self._send_json(403, {"ok": False, "error": "licence assertions are accepted only from the pinned extension"})
+            self._send_json(403, {"ok": False, "error": "licence assertions are accepted only from the pinned extension"}, _cors_headers_for(self.headers))
             return
         self._bridge.note_license_assertion(self._read_body())
         self._send_json(200, {"ok": True}, _cors_headers_for(self.headers))
@@ -1002,20 +1028,20 @@ class _Handler(BaseHTTPRequestHandler):
         # popup, where a human clicked a button. That click is the explicit
         # human consent auth.py's contract requires; this endpoint is the
         # "web-ui: an explicit UI button/confirm" its docstring promised.
+        cors = _cors_headers_for(self.headers)
         origin = self.headers.get("origin") or ""
         if origin not in _ALLOWED_EXTENSION_ORIGINS:
-            self._send_json(403, {"ok": False, "error": "authorize is accepted only from the pinned extension popup"})
+            self._send_json(403, {"ok": False, "error": "authorize is accepted only from the pinned extension popup"}, cors)
             return
         auth = self._bridge.auth
         if auth is None:
-            self._send_json(503, {"ok": False, "error": "Chrome control is not enabled in this session (no my_browser_* tools registered)."})
+            self._send_json(503, {"ok": False, "error": "Chrome control is not enabled in this session (no my_browser_* tools registered)."}, cors)
             return
         try:
             body = json.loads(self._read_body() or "{}")
         except json.JSONDecodeError:
-            self._send_json(400, {"ok": False, "error": "Invalid JSON"})
+            self._send_json(400, {"ok": False, "error": "Invalid JSON"}, cors)
             return
-        cors = _cors_headers_for(self.headers)
         if body.get("revoke"):
             message = auth.revoke()
         else:
@@ -1036,17 +1062,17 @@ class _Handler(BaseHTTPRequestHandler):
         }, cors)
 
     def _handle_result(self) -> None:
+        cors = _cors_headers_for(self.headers)
         if not _is_browser_origin_allowed(self.headers):
-            self._send_json(403, {"ok": False, "error": "browser origin not allowed"})
+            self._send_json(403, {"ok": False, "error": "browser origin not allowed"}, cors)
             return
         self._bridge._mark_seen()
         try:
             result = json.loads(self._read_body() or "{}")
         except json.JSONDecodeError:
-            self._send_json(400, {"ok": False, "error": "Invalid JSON"})
+            self._send_json(400, {"ok": False, "error": "Invalid JSON"}, cors)
             return
         delivered = self._bridge._deliver_result(result)
-        cors = _cors_headers_for(self.headers)
         if not delivered:
             self._send_json(404, {"ok": False, "error": "unknown command id"}, cors)
             return

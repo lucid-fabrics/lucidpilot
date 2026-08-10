@@ -1,6 +1,20 @@
 {
   "name": "lucidpilot",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Drive your real, signed-in Chrome from Claude Code: 21 my_browser_* browser-control tools and 6 indicator_* overlay tools, all licence-gated, plus the /lp command for authorize/status/doctor/license. Requires python3 only - no pip packages.",
-  "author": { "name": "Wassim Mehanna" }
+  "author": { "name": "Wassim Mehanna" },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^mcp__(claude-in-chrome|chrome-devtools)__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/pretooluse_hook.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
 }

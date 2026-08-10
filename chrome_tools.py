@@ -25,7 +25,7 @@ from typing import Any, Callable
 
 from . import bridge as bridge_module
 from .auth import ChromeAuth, ChromeAuthError
-from .bridge import ChromeProfileBridge, BridgeError, DEFAULT_TIMEOUT_MS, extension_load_path
+from .bridge import ChromeProfileBridge, BridgeError, DEFAULT_TIMEOUT_MS, CHROME_WEB_STORE_URL, extension_load_path
 from .formatters import (
     MAX_ELEMENTS,
     format_chrome_inspect,
@@ -41,6 +41,14 @@ from .licensing import LicenseRequiredError, is_pro_licensed, require_pro_licens
 # not the agent: the group is per-machine and can outlive any one session, and
 # a Claude Code user seeing a group called "Hermes" is just confusing.
 GROUP_TITLE = "LucidPilot"
+
+# click/tap are the only actions glue.js can pause for a human's approve/deny
+# on a submit/buy/pay-shaped target (see glue.js's requestConfirmation,
+# default wait 180s). DEFAULT_TIMEOUT_MS (30s) would time this side out
+# before a human has a realistic chance to even see the prompt, so these two
+# get a longer, matching budget instead - keep in step with glue.js's own
+# requestConfirmation default plus headroom for the click itself.
+_CLICK_TIMEOUT_MS = 200_000
 
 # Prepended to the description of every entry-point tool (see add()). Says the
 # one thing that distinguishes these from the other browser stacks a session
@@ -192,20 +200,23 @@ def register_all_tools(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> No
             _send(auth, bridge, "tab.new", _wire(bridge, {"url": url, "background": args.get("background")}))
             return f"Chrome bridge connected; opened {url}"
         ext_path = extension_load_path()
-        select_line = (
-            f"4. Select: {ext_path}"
-            if ext_path
-            else "4. Select the unzipped lucidpilot-chrome-extension.zip from the releases page\n"
-            "   (this install has no built chrome-extension/dist; `npm ci && npm run build` in a checkout also works)."
-        )
         status = "connected" if bridge.connected else "waiting for extension"
+        if ext_path is None:
+            return (
+                f"Chrome profile bridge is listening at {bridge.url}.\n\n"
+                "Install the companion Chrome extension from the Chrome Web Store:\n"
+                f"  {CHROME_WEB_STORE_URL}\n"
+                "New listings can sit in Google's review queue for a couple of weeks before\n"
+                "they go live - if the link 404s or shows 'pending', that's why, not a broken link.\n\n"
+                f"Status: {status}."
+            )
         return (
             f"Chrome profile bridge is listening at {bridge.url}.\n\n"
             "To connect your existing Chrome profile:\n"
             "1. Open chrome://extensions in the browser profile you normally use.\n"
             "2. Enable Developer mode.\n"
             '3. Click "Load unpacked".\n'
-            f"{select_line}\n\n"
+            f"4. Select: {ext_path}\n\n"
             f"Status: {status}."
         )
 
@@ -397,8 +408,8 @@ def register_all_tools(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> No
     )
 
     # -- interaction tools with includeSnapshot ---------------------------
-    def _interaction(action: str, args: dict, describe: Callable[[dict, Any], str]) -> str:
-        raw = _send(auth, bridge, action, _wire(bridge, args))
+    def _interaction(action: str, args: dict, describe: Callable[[dict, Any], str], timeout_ms: int = DEFAULT_TIMEOUT_MS) -> str:
+        raw = _send(auth, bridge, action, _wire(bridge, args), timeout_ms)
         result = raw.get("result") if (args.get("includeSnapshot") and isinstance(raw, dict)) else raw
         summary = summarize_action_result(result)
         text = describe(args, summary)
@@ -408,7 +419,7 @@ def register_all_tools(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> No
         def describe(a: dict, summary: str | None) -> str:
             target = a.get("uid") or a.get("selector") or f"{a.get('x')},{a.get('y')}"
             return f"Clicked {target} - {summary}" if summary else f"Clicked {target}"
-        return _interaction("page.click", args, describe)
+        return _interaction("page.click", args, describe, _CLICK_TIMEOUT_MS)
 
     add(
         "my_browser_click",
@@ -643,7 +654,7 @@ def register_all_tools(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> No
     )
 
     def h_tap(args: dict) -> str:
-        _send(auth, bridge, "page.tap", _wire(bridge, args))
+        _send(auth, bridge, "page.tap", _wire(bridge, args), _CLICK_TIMEOUT_MS)
         target = args.get("uid") or args.get("selector") or f"{args.get('x')},{args.get('y')}"
         return f"Tapped {target} (touch)"
 
