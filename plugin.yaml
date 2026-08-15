@@ -1,12 +1,13 @@
 name: lucidpilot
-version: "1.1.0"
+version: "1.3.0"
 description: >-
   Drives the user's real, signed-in Chrome profile through LucidPilot's own
   companion Chrome extension over a loopback bridge (port 16329 by default):
   tabs, accessibility snapshot, navigation, interaction (click/type/fill/
   key/hover/drag/scroll/tap), file upload, screenshots, and console/network
-  observation via the my_browser_* tools. Locked by default, unlocked with /lp
-  authorize. Also shows a blue/violet border, mouse-like cursor,
+  observation via the my_browser_* tools. Locked by default, unlocked
+  automatically by licence activation in the extension popup (/lp revoke
+  re-locks). Also shows a blue/violet border, mouse-like cursor,
   target-element highlights, and an action toast in that same Chrome while
   driving it (indicator_* tools, always on, purely cosmetic), plus a local
   flight-recorder log viewable from the toolbar popup; indicator_* also

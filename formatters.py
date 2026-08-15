@@ -16,6 +16,14 @@ MAX_TEXT_CHARS = 30_000
 MAX_ELEMENTS = 80
 
 _WS_RE = re.compile(r"\s+")
+# C0/C1 control chars, DEL, and Unicode bidi overrides/isolates. The snapshot
+# runs in the page's MAIN world, so labels are attacker-controlled: left
+# intact, an ANSI escape or a right-to-left override in a label could inject
+# into a terminal that renders this text, or make a uid's label read as its
+# reverse ("Delete" ⇄ ...). Stripped from every label/text the agent sees.
+_CONTROL_RE = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f‎‏‪-‮⁦-⁩]"
+)
 
 
 def truncate_text(text: str, max_chars: int = MAX_TEXT_CHARS) -> str:
@@ -29,14 +37,31 @@ def safe_json(value: Any) -> str:
 
 
 def compact_line(value: Any, max_len: int = 140) -> str:
-    text = _WS_RE.sub(" ", str(value if value is not None else "")).strip()
+    text = _CONTROL_RE.sub("", str(value if value is not None else ""))
+    text = _WS_RE.sub(" ", text).strip()
     return f"{text[: max_len - 1]}…" if len(text) > max_len else text
 
 
 def rect_text(rect: Any) -> str:
-    if not rect:
+    # isinstance AND truthiness: a hostile page can send rect as a string or
+    # list, which is truthy but has no .get() - that used to raise (caught by
+    # chrome_tools._guard, but it blinded the agent on that page). Empty dict
+    # keeps its old "?" too.
+    if not isinstance(rect, dict) or not rect:
         return "?"
     return f"{rect.get('x')},{rect.get('y')} {rect.get('width')}x{rect.get('height')}"
+
+
+def _d(value: Any) -> dict:
+    """A dict, or an empty one. Guards `x.get(...)` reads against a hostile
+    page sending a truthy non-dict where a dict is expected."""
+    return value if isinstance(value, dict) else {}
+
+
+def _dicts(value: Any) -> list:
+    """The dict items of a list, or []. Guards `for x in list: x.get(...)`
+    loops against non-dict items (or a non-list) from a hostile page."""
+    return [x for x in value if isinstance(x, dict)] if isinstance(value, list) else []
 
 
 def _get(obj: Any, *keys: str, default: Any = None) -> Any:
@@ -51,7 +76,9 @@ def _get(obj: Any, *keys: str, default: Any = None) -> Any:
 
 def format_chrome_snapshot(snapshot: Any) -> str:
     if not isinstance(snapshot, dict):
-        return safe_json(snapshot)
+        # truncate too: a forged bare string/array snapshot would otherwise
+        # echo back in full, uncapped.
+        return truncate_text(safe_json(snapshot))
     if snapshot.get("mode") == "full":
         return truncate_text(safe_json(snapshot))
 
@@ -61,19 +88,19 @@ def format_chrome_snapshot(snapshot: Any) -> str:
     lines.append(f"{snapshot.get('title') or '(untitled)'}")
     if snapshot.get("url"):
         lines.append(f"{snapshot['url']}")
-    vp = snapshot.get("viewport")
+    vp = _d(snapshot.get("viewport"))
     if vp:
         lines.append(
             f"viewport={vp.get('width')}x{vp.get('height')} "
             f"scroll={vp.get('scrollX') or 0},{vp.get('scrollY') or 0}"
         )
 
-    summary = snapshot.get("summary") or {}
+    summary = _d(snapshot.get("summary"))
     if summary.get("modal"):
-        m = summary["modal"]
+        m = _d(summary.get("modal"))
         lines.append(f"modal: {m.get('uid')} {compact_line(m.get('label'))}")
     if summary.get("focused"):
-        f = summary["focused"]
+        f = _d(summary.get("focused"))
         lines.append(f"focused: {f.get('uid')} {f.get('role') or ''} {compact_line(f.get('label'))}")
     hints = summary.get("hints")
     if isinstance(hints, list) and hints:
@@ -81,19 +108,19 @@ def format_chrome_snapshot(snapshot: Any) -> str:
         for hint in hints[:6]:
             lines.append(f"- {hint}")
 
-    diff = snapshot.get("diff")
+    diff = _d(snapshot.get("diff"))
     if diff and not diff.get("firstSnapshot"):
         changed: list[str] = []
-        for c in diff.get("changes") or []:
+        for c in _dicts(diff.get("changes")):
             if c.get("kind") == "textChanged":
                 changed.append("text changed")
             else:
                 changed.append(
                     f"{c.get('kind')}: {compact_line(c.get('before'), 50)} → {compact_line(c.get('after'), 50)}"
                 )
-        for e in (diff.get("added") or [])[:4]:
+        for e in _dicts(diff.get("added"))[:4]:
             changed.append(f"added {e.get('uid')} {e.get('role') or ''} {compact_line(e.get('label'))}")
-        for u in (diff.get("updated") or [])[:4]:
+        for u in _dicts(diff.get("updated"))[:4]:
             after_label = _get(u, "after", "label") or _get(u, "before", "label")
             changed.append(f"updated {u.get('uid')} {compact_line(after_label)}")
         if changed:
@@ -104,7 +131,7 @@ def format_chrome_snapshot(snapshot: Any) -> str:
     matches = snapshot.get("matches")
     if isinstance(matches, list) and matches:
         lines.append(f'\n## Matches for "{snapshot.get("query")}"')
-        for match in matches[:12]:
+        for match in _dicts(matches)[:12]:
             kind = match.get("kind")
             if kind == "text":
                 lines.append(f"- {match.get('uid')} text {compact_line(match.get('text'))} @ {rect_text(match.get('rect'))}")
@@ -117,23 +144,23 @@ def format_chrome_snapshot(snapshot: Any) -> str:
                 role = match.get("role") or match.get("tag") or "element"
                 lines.append(f"- {match.get('uid')} {role}{disabled} {compact_line(label)} @ {rect_text(match.get('rect'))}")
 
-    if mode == "pageMap" and snapshot.get("pageMap"):
-        page_map = snapshot["pageMap"]
+    page_map = _d(snapshot.get("pageMap"))
+    if mode == "pageMap" and page_map:
         lines.append("\n## Page map")
-        for region in (page_map.get("regions") or [])[:18]:
+        for region in _dicts(page_map.get("regions"))[:18]:
             lines.append(f"- {region.get('uid')} {region.get('kind')}: {compact_line(region.get('label'))}")
-            for action in (region.get("actions") or [])[:5]:
+            for action in _dicts(region.get("actions"))[:5]:
                 disabled = " disabled" if action.get("disabled") else ""
                 lines.append(f"  - {action.get('uid')} {action.get('role') or ''}{disabled} {compact_line(action.get('label'))}")
         if page_map.get("headings"):
             lines.append("\nHeadings:")
-            for h in page_map["headings"][:20]:
+            for h in _dicts(page_map.get("headings"))[:20]:
                 lines.append(f"- {h.get('uid')} h{h.get('level') or ''} {compact_line(h.get('text'))}")
 
     layout = snapshot.get("layout")
     if isinstance(layout, list) and layout and mode != "changes":
         lines.append("\n## Layout / context")
-        for section in layout[: 18 if mode == "pageMap" else 8]:
+        for section in _dicts(layout)[: 18 if mode == "pageMap" else 8]:
             bits = [
                 str(section.get("uid")),
                 section.get("role") or section.get("tag"),
@@ -143,21 +170,21 @@ def format_chrome_snapshot(snapshot: Any) -> str:
             lines.append(f"- {' '.join(b for b in bits if b)}")
             field_labels = [
                 f"{f.get('uid')} {compact_line(f.get('label') or f.get('role'), 40)}"
-                for f in (section.get("fields") or [])[:4]
+                for f in _dicts(section.get("fields"))[:4]
             ]
             action_labels = [
                 f"{a.get('uid')}{' disabled' if a.get('disabled') else ''} {compact_line(a.get('label') or a.get('role'), 40)}"
-                for a in (section.get("actions") or [])[:5]
+                for a in _dicts(section.get("actions"))[:5]
             ]
             if field_labels:
                 lines.append(f"  fields: {'; '.join(field_labels)}")
             if action_labels:
                 lines.append(f"  actions: {'; '.join(action_labels)}")
 
-    forms = snapshot.get("forms") or {}
+    forms = _d(snapshot.get("forms"))
     if (mode == "forms" or forms.get("fields")) and mode != "pageMap":
-        fields = forms.get("fields") or []
-        submits = forms.get("submits") or []
+        fields = _dicts(forms.get("fields"))
+        submits = _dicts(forms.get("submits"))
         if fields or submits:
             lines.append("\n## Forms")
         for field_ in fields[: 40 if mode == "forms" else 12]:
@@ -178,8 +205,8 @@ def format_chrome_snapshot(snapshot: Any) -> str:
             disabled = " disabled" if submit.get("disabled") else ""
             lines.append(f"- {submit.get('uid')} submit/action{disabled} {compact_line(submit.get('label') or submit.get('selector'))} @ {rect_text(submit.get('rect'))}")
 
-    elements = snapshot.get("elements")
-    if isinstance(elements, list) and mode != "pageMap":
+    elements = _dicts(snapshot.get("elements"))
+    if isinstance(snapshot.get("elements"), list) and mode != "pageMap":
         lines.append("\n## Visible actions")
         limit = 60 if mode == "interactive" else 25
         for el in elements[:limit]:
@@ -203,7 +230,7 @@ def format_chrome_snapshot(snapshot: Any) -> str:
             lines.append("\n## Text snippets")
             limit = 40 if mode == "text" else 14
             char_limit = 240 if mode == "text" else 160
-            for snip in snippets[:limit]:
+            for snip in _dicts(snippets)[:limit]:
                 lines.append(f"- {snip.get('uid')} {compact_line(snip.get('text'), char_limit)}")
             if snapshot.get("textTruncated"):
                 lines.append("- … page text truncated; retry with mode=text or maxTextChars for more")
@@ -220,7 +247,7 @@ def format_included_snapshot_text(raw: Any, text: str) -> str:
 def format_chrome_inspect(inspect: Any) -> str:
     if not isinstance(inspect, dict):
         return safe_json(inspect)
-    t = inspect.get("target") or {}
+    t = _d(inspect.get("target"))
     lines: list[str] = []
     lines.append(f"# Element inspect {t.get('uid') or ''}".strip())
     occluded = f" occluded-by-{_get(t, 'occluded', 'tag')}" if t.get("occluded") else ""
@@ -237,34 +264,34 @@ def format_chrome_inspect(inspect: Any) -> str:
     nearby_text = inspect.get("nearbyText")
     if isinstance(nearby_text, list) and nearby_text:
         lines.append("\n## Nearby text")
-        for item in nearby_text[:12]:
+        for item in _dicts(nearby_text)[:12]:
             lines.append(f"- {item.get('uid')} {compact_line(item.get('text'), 180)}")
 
-    form_ctx = inspect.get("formContext")
+    form_ctx = _d(inspect.get("formContext"))
     if form_ctx:
         lines.append("\n## Form context")
-        for field_ in (form_ctx.get("fields") or [])[:20]:
+        for field_ in _dicts(form_ctx.get("fields"))[:20]:
             value = (
                 f" value={compact_line(field_['value'], 60)}" if field_.get("value")
                 else " value=[redacted]" if field_.get("valueRedacted") else ""
             )
             disabled = " disabled" if field_.get("disabled") else ""
             lines.append(f"- {field_.get('uid')} {field_.get('role') or field_.get('tag')}{disabled} {compact_line(field_.get('label') or field_.get('selector'))}{value}")
-        for action in (form_ctx.get("actions") or [])[:10]:
+        for action in _dicts(form_ctx.get("actions"))[:10]:
             disabled = " disabled" if action.get("disabled") else ""
             lines.append(f"- {action.get('uid')} action{disabled} {compact_line(action.get('label') or action.get('selector'))}")
 
     nearby_actions = inspect.get("nearbyActions")
     if isinstance(nearby_actions, list) and nearby_actions:
         lines.append("\n## Nearby actions")
-        for action in nearby_actions[:18]:
+        for action in _dicts(nearby_actions)[:18]:
             disabled = " disabled" if action.get("disabled") else ""
             lines.append(f"- {action.get('uid')} {action.get('role') or action.get('tag')}{disabled} {compact_line(action.get('label') or action.get('selector'))} @ {rect_text(action.get('rect'))}")
 
     ancestors = inspect.get("ancestors")
     if isinstance(ancestors, list) and ancestors:
         lines.append("\n## Ancestors")
-        for a in ancestors[:6]:
+        for a in _dicts(ancestors)[:6]:
             lines.append(f"- {a.get('uid')} {a.get('role') or a.get('tag')} {compact_line(a.get('label') or a.get('selector'), 120)}")
 
     return truncate_text("\n".join(lines))

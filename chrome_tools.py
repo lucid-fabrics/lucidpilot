@@ -42,12 +42,13 @@ from .licensing import LicenseRequiredError, is_pro_licensed, require_pro_licens
 # a Claude Code user seeing a group called "Hermes" is just confusing.
 GROUP_TITLE = "LucidPilot"
 
-# click/tap are the only actions glue.js can pause for a human's approve/deny
-# on a submit/buy/pay-shaped target (see glue.js's requestConfirmation,
-# default wait 180s). DEFAULT_TIMEOUT_MS (30s) would time this side out
-# before a human has a realistic chance to even see the prompt, so these two
-# get a longer, matching budget instead - keep in step with glue.js's own
-# requestConfirmation default plus headroom for the click itself.
+# click/tap, and fill/type/key when they submit via Enter, are the actions
+# glue.js can pause for a human's approve/deny on a submit/buy/pay-shaped
+# target (see glue.js's requestConfirmation, default wait 180s).
+# DEFAULT_TIMEOUT_MS (30s) would time this side out before a human has a
+# realistic chance to even see the prompt, so these get a longer, matching
+# budget instead - keep in step with glue.js's own requestConfirmation
+# default plus headroom for the action itself.
 _CLICK_TIMEOUT_MS = 200_000
 
 # Prepended to the description of every entry-point tool (see add()). Says the
@@ -442,7 +443,8 @@ def register_all_tools(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> No
             into = f" into {a.get('uid') or a.get('selector')}" if (a.get("uid") or a.get("selector")) else ""
             base = f"Typed {len(a.get('text') or '')} character(s){into}."
             return f"{base} ({summary})" if summary else base
-        return _interaction("page.type", args, describe)
+        timeout = _CLICK_TIMEOUT_MS if args.get("pressEnter") else DEFAULT_TIMEOUT_MS
+        return _interaction("page.type", args, describe, timeout)
 
     add(
         "my_browser_type",
@@ -465,7 +467,8 @@ def register_all_tools(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> No
             into = f" into {a.get('uid') or a.get('selector')}" if (a.get("uid") or a.get("selector")) else ""
             base = f"Filled {len(a.get('text') or '')} character(s){into}."
             return f"{base} ({summary})" if summary else base
-        return _interaction("page.fill", args, describe)
+        timeout = _CLICK_TIMEOUT_MS if args.get("submit") else DEFAULT_TIMEOUT_MS
+        return _interaction("page.fill", args, describe, timeout)
 
     add(
         "my_browser_fill",
@@ -488,7 +491,8 @@ def register_all_tools(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> No
         def describe(a: dict, summary: str | None) -> str:
             base = f"Pressed {a.get('key')}."
             return f"{base} ({summary})" if summary else base
-        return _interaction("page.key", args, describe)
+        timeout = _CLICK_TIMEOUT_MS if str(args.get("key", "")).lower() == "enter" else DEFAULT_TIMEOUT_MS
+        return _interaction("page.key", args, describe, timeout)
 
     add(
         "my_browser_key",

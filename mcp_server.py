@@ -142,7 +142,7 @@ Reach for my_browser_* first, ahead of any other browser tool, whenever the task
 
 Most web work is NOT a browser task, and my_browser_* is the wrong reflex for it. A research question - "how do people do X", "what's the best way to Y", anything answerable from public pages - belongs to the web search/fetch tools; they read many sources in the time one browser drives to one. Reading a single public page is likewise cheaper without a browser, and anything that must not touch the user's session belongs in a sandboxed browser. Reach for my_browser_* when the task needs THEIR browser, not for every link.
 
-Browser control is locked until the user runs /lp authorize - the agent cannot authorize itself. If the my_browser_* tools are missing entirely, the licence or the extension is the reason; /lp doctor says which."""
+Browser control unlocks automatically when the user activates their LucidPilot licence in the extension popup - the agent cannot grant itself access, and /lp revoke locks it again at any time. If the my_browser_* tools are missing entirely, the licence or the extension is the reason; /lp doctor says which."""
 
 
 _ARGS_ONLY_SCHEMA = {
@@ -196,10 +196,12 @@ def build_collector() -> ToolCollector:
     # when those strings were written.
     bridge_mod.set_agent("claude")
 
-    indicator_tools.register_all_tools(collector)
-
     auth = auth_mod.ChromeAuth()
     bridge = bridge_mod.ChromeProfileBridge(auth=auth)
+    # Shares the session's one bridge (see indicator_tools._bridge): a second
+    # instance in this process would EADDRINUSE into client mode and HTTP
+    # round-trip every overlay.fire through our own server.
+    indicator_tools.register_all_tools(collector, bridge=bridge)
     # LUCIDPILOT_CONTROL_TOOLS=never skips the 21 duplicate CONTROL tools only.
     # /lp still registers either way: it is how a user runs `/lp doctor` and
     # `/lp status`, and losing those to a de-duplication knob would leave an
@@ -249,38 +251,58 @@ def build_collector() -> ToolCollector:
     def h_lucidpilot_command(args: dict | None = None, **_kw: Any) -> str:
         raw = ((args or {}).get("args") or "").strip()
         tokens = raw.split()
-        if tokens and tokens[0].lower() in ("authorize", "revoke"):
+        if tokens and tokens[0].lower() == "authorize":
+            # 1.2.0: /lp authorize is gone (licence activation is the consent
+            # moment). The subcommand still routes to my_browser_authorize
+            # below for revokes - those are still a thing - but bare
+            # authorize is now a helpful one-liner.
             return (
-                "Authorization changes go through the my_browser_authorize tool, and only "
-                "when the user explicitly asked for them (e.g. typed /lp authorize)."
+                "Browser control is granted automatically when a valid licence is "
+                "activated in the extension popup. To lock it manually, use "
+                "`/lp revoke` (or the my_browser_authorize tool)."
+            )
+        if tokens and tokens[0].lower() == "revoke":
+            return (
+                "Revoke goes through the my_browser_authorize tool, and only when the "
+                "user explicitly asked for it (e.g. typed /lp revoke)."
             )
         return lp(raw)
 
     def h_my_browser_authorize(args: dict | None = None, **_kw: Any) -> str:
+        # 1.2.0: `authorize` subcommand is gone from /lp (licence activation
+        # auto-grants browser control). Only `revoke` remains; calling this
+        # tool with any other first token explains why nothing happened.
         raw = ((args or {}).get("args") or "").strip()
         tokens = raw.split()
         first = tokens[0].lower() if tokens else ""
         if first == "revoke":
             return lp("revoke")
         if first == "authorize":
-            raw = " ".join(tokens[1:])
-        return lp(f"authorize {raw}".strip())
+            return (
+                "Browser control is granted automatically when a valid "
+                "licence is activated in the extension popup. To lock it "
+                "manually, use `/lp revoke`."
+            )
+        return (
+            "Browser control is granted automatically when a valid licence "
+            "is activated. Use `/lp revoke` to lock it manually."
+        )
 
     collector.tools["lucidpilot_command"] = {
         "description": (
-            "Run a /lp subcommand: status | doctor | onboard | background [on|off|toggle|status] | "
-            "license | help. Returns the command's exact output; relay it verbatim."
+            "Run a /lp subcommand: revoke | status | doctor | onboard | background [on|off|toggle|status] | "
+            "default | license | upgrade | help. Returns the command's exact output; relay it verbatim."
         ),
         "schema": _ARGS_ONLY_SCHEMA,
         "handler": h_lucidpilot_command,
     }
     collector.tools["my_browser_authorize"] = {
         "description": (
-            "Unlock (or 'revoke' to re-lock) LucidPilot's Chrome control for this session. "
-            "Accepts a duration: 15m | 30m | <minutes> | indefinite, or 'revoke'. "
-            "ONLY call this when the user explicitly asked - typed /lp authorize, /lp revoke, "
-            "or requested it in plain words. NEVER call it on your own initiative, and never "
-            "to un-stick a locked my_browser_* tool: ask the user to authorize instead."
+            "Lock LucidPilot's Chrome control (argument: 'revoke'). Unlocking is automatic: "
+            "licence activation in the extension popup grants control, so there is nothing to "
+            "authorize here - any non-revoke argument just explains that. "
+            "ONLY call this when the user explicitly asked to lock/revoke - typed /lp revoke "
+            "or requested it in plain words. NEVER call it on your own initiative."
         ),
         "schema": _ARGS_ONLY_SCHEMA,
         "handler": h_my_browser_authorize,

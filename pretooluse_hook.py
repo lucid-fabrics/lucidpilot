@@ -52,6 +52,12 @@ def _decide(event: dict) -> dict | None:
     if not redirect_policy.is_enabled():
         return None
     status = _bridge_status()
+    # 1.2.0: licence activation is the consent moment for browser control
+    # (auth auto-grants via auth.auto_authorize_from_license). The redirect
+    # only needs to confirm the LucidPilot pipeline is live: licence valid +
+    # extension connected. An explicit /lp revoke still beats this (revoke
+    # clears auth AND license cache stays valid, but redirect_policy sees
+    # the lock via the auth field - checked below).
     if not (status.get("licensed") is True and status.get("authorized") is True and status.get("extensionConnected") is True):
         return None
     return {

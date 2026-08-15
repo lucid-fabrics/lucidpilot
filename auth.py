@@ -1,16 +1,19 @@
 """Authorization gate for LucidPilot's my_browser_* tools.
 
-Chrome control is **locked by default**. The agent can never grant itself access:
-authorization is a human action (CLI: ``/lp authorize``; web-ui: an explicit
-UI button/confirm that calls this module). The one standing form of that consent
-is the LUCIDPILOT_AUTO_AUTHORIZE env var: a human setting it in their own
-environment is the same power-user opt-out as ``authorize indefinite``, and it
-makes every fresh ``ChromeAuth`` grant itself that duration at construction so
-new sessions start unlocked. ``ChromeAuth`` is otherwise a pure state holder:
-it records *until when* control is granted; the responsibility for obtaining human
-consent belongs to the caller.
+1.2.0 model: licence activation IS the consent moment for browser control.
+``auto_authorize_from_license(True)`` is called by the bridge on every
+licence assertion (typed key + server check + signed token). There is no
+separate ``/lp authorize`` step - typing a 24+ char licence key into the
+extension popup and having it verify against the licence server is a
+stronger consent signal than typing ``/lp authorize`` once.
 
-Two-layer gate (mirrors the original design):
+The agent CANNOT grant itself access: the licence server is the
+authority. ``/lp revoke`` stays as a manual kill switch for the user.
+License server-side revocation (refund / chargeback / ban) propagates
+to the bridge on the next licence assertion (≤25s typical) and the
+auto-grant is automatically revoked - see auto_authorize_from_license.
+
+Two-layer gate:
   * visibility layer: ``is_authorized`` is used as each my_browser_* tool's ``check_fn``
     so the tools do not even appear in the agent's context while locked.
   * runtime layer: ``require_authorized`` is called inside every tool handler
@@ -20,7 +23,7 @@ Expiry is lazy: there is no timer; ``is_authorized`` compares the stored deadlin
 against the current time on every call.
 
 A grant carries two clocks, both lazy:
-  * the hard cap - the deadline set at authorize time (default 8 hours);
+  * the hard cap - the deadline set at authorize time (default 24 hours);
   * the idle lock - IDLE_LOCK_S (1 hour) since the last actual use.
 ``require_authorized`` stamps last-use on every successful call, so an agent
 actively driving Chrome never idle-locks; only true inactivity does. A grant of
@@ -31,7 +34,7 @@ The grant PERSISTS across processes (``~/.hermes/lucidpilot/auth.json``).
 It used to be memory-only, which meant every agent restart - and each restart
 is frequent - dropped the grant and made the human authorize again, several
 times an hour. What the human actually consented to was "Chrome control for
-the next 8 hours on this machine", not "until this particular process exits".
+the next 24 hours on this machine", not "until this particular process exits".
 Both clocks still apply to a restored grant, so persistence widens nothing:
 an 8h grant is still 8h from when it was given, still idle-locks after an
 hour unused, and ``revoke`` still kills it instantly for every process.
@@ -89,6 +92,28 @@ def _read_state() -> dict:
         return {}
 
 
+def _file_stamp() -> tuple | None:
+    """(mtime_ns, inode, size) of auth.json, or None when absent/unreadable.
+
+    The inode is what makes the stamp collision-proof: _write_state goes
+    through os.replace, so every write is a fresh inode even when two states
+    are byte-identical in size and land in the same mtime bucket (coarse
+    filesystems; revoke() vs auto-grant differ only by true/false swapped).
+
+    Cheap change detector: is_authorized() stats the file on every call and
+    re-reads it only when the stamp moved. This is what makes revoke() in one
+    process actually lock every OTHER live process - state used to be read
+    once at construction, so a sibling session kept its in-memory grant until
+    restart, contradicting the module docstring's "kills it instantly for
+    every process".
+    """
+    try:
+        st = os.stat(_STATE_FILE)
+        return (st.st_mtime_ns, st.st_ino, st.st_size)
+    except OSError:
+        return None
+
+
 def _write_state(state: dict) -> None:
     """Atomic replace, so a crash mid-write can never leave a half-written
     file that _read_state would treat as 'locked' - or worse, as a grant."""
@@ -113,30 +138,68 @@ def _write_state(state: dict) -> None:
 
 
 class ChromeAuth:
-    def __init__(self, default_timeout_minutes: int = 480) -> None:
+    def __init__(self, default_timeout_minutes: int = 1440) -> None:
         # None = locked; float = epoch seconds deadline; "indefinite" = until revoked.
         self._authorized_until: float | str | None = None
         # Epoch seconds of the last successful require_authorized() (or the
         # authorize() itself) - drives the idle lock.
         self._last_used: float = 0.0
+        # True iff the current grant was issued by auto_authorize_from_license
+        # (i.e. as a side-effect of licence activation, not an explicit
+        # /lp authorize or operator action). License server-side revocation
+        # only revokes AUTO grants - explicit grants (which an operator made
+        # for a reason) survive a licence lapse. Cleared on revoke(), on a
+        # subsequent explicit authorize() (operator took over), and on
+        # license loss.
+        self._auto_granted: bool = False
+        # True iff the user explicitly ran /lp revoke - the killswitch.
+        # While set, auto_authorize_from_license(True) does NOT grant.
+        # Cleared by auto_authorize_from_license(False) (server-side loss
+        # acts as an implicit reset, so the user isn't permanently locked
+        # out if the licence lapses and returns). The only way to clear
+        # without a licence round-trip is to manually edit auth.json.
+        self._user_revoked: bool = False
         self._default_timeout_minutes = default_timeout_minutes
         self._lock = threading.Lock()
+        # Stamp of auth.json as of the last read or write; drives the
+        # cross-process re-sync in _sync_if_changed.
+        self._state_stamp: tuple | None = None
         self._restore()
         self._auto_authorize()
 
     def _restore(self) -> None:
-        """Adopt a still-valid grant left by an earlier process.
+        """Mirror auth.json into memory: adopt a still-valid grant, drop a
+        grant the file no longer shows. Called at construction and again by
+        _sync_if_changed whenever the file changes under us (a sibling
+        process revoked, re-granted, or extended).
 
         Both clocks are re-applied here rather than trusted: a stored grant
         whose cap has passed, or that has sat unused past the idle window, is
         simply not restored - so a file that outlives its validity grants
         nothing, even if it is stale by weeks.
+
+        Caller must hold self._lock (or be the constructor, pre-sharing).
         """
+        # Stamp BEFORE reading: if a writer lands between stat and read we
+        # keep an older stamp and simply re-read the same content next call.
+        self._state_stamp = _file_stamp()
+        # Full mirror: reset first so a file that lost its grant (revoke in
+        # another process) clears ours instead of being ignored.
+        self._authorized_until = None
+        self._last_used = 0.0
         state = _read_state()
         until = state.get("authorized_until")
         last_used = state.get("last_used")
         if not isinstance(last_used, (int, float)):
+            self._auto_granted = bool(state.get("auto_granted", False))
+            self._user_revoked = bool(state.get("user_revoked", False))
             return
+        # Persisted flag defaults to False on older state files; if the
+        # grant is missing or stale we still return below, so the flag never
+        # matters on a missing grant. Carried through here so a process
+        # restart preserves the auto-vs-operator distinction.
+        self._auto_granted = bool(state.get("auto_granted", False))
+        self._user_revoked = bool(state.get("user_revoked", False))
         if until == _INDEFINITE:
             self._authorized_until = _INDEFINITE
             self._last_used = float(last_used)
@@ -164,18 +227,50 @@ class ChromeAuth:
 
     def _persist(self) -> None:
         """Caller must hold self._lock."""
-        _write_state({"authorized_until": self._authorized_until, "last_used": self._last_used})
+        data = {
+            "authorized_until": self._authorized_until,
+            "last_used": self._last_used,
+            "auto_granted": self._auto_granted,
+            "user_revoked": self._user_revoked,
+        }
+        _write_state(data)
+        # Adopt our own write's stamp so the next is_authorized doesn't
+        # pointlessly re-read what we just wrote. If the write failed
+        # (read-only home), the stamp is unchanged and the in-memory grant
+        # keeps working for this process, same as before.
+        self._state_stamp = _file_stamp()
+
+    def _sync_if_changed(self) -> None:
+        """Re-mirror auth.json when its stamp moved. Caller must hold
+        self._lock. This is the cross-process propagation path: revoke() in
+        any process is observed here by every other process on its next
+        is_authorized()/require_authorized() call."""
+        if _file_stamp() != self._state_stamp:
+            self._restore()
 
     # -- queries -----------------------------------------------------------
 
     def is_authorized(self) -> bool:
-        """True while a grant is active. Lazily clears an expired grant.
+        """True while a grant is active. Never writes the file; the only
+        mutation is re-mirroring auth.json into memory when a sibling
+        process changed it (_sync_if_changed), which is the opposite of the
+        divergence described below.
 
-        Used as the ``check_fn`` for every my_browser_* tool, so it must be cheap and
-        side-effect-light (the only mutation is the same lazy clear-on-expiry
-        it always had, now for the idle clock too).
+        Earlier revisions lazily cleared expired grants in this method. That
+        caused a real divergence: a stale in-memory state (the bridge
+        started 7 hours ago, last_used was set at startup) reads as idle
+        here, the method clears the grant, but the FILE still shows the
+        original grant - and because the bridge never re-reads the file,
+        the in-memory cleared state wins until something explicitly
+        re-grants. End result: the user sees "locked" while the file
+        shows a valid 24h grant. Pure read sidesteps this entirely:
+        idle-lock is enforced by returning False, the grant is left for
+        the next license assertion cycle to re-grant. Cleanup of the
+        cleared state happens via revoke() (explicit) or via the next
+        license change (license loss + auto-revoke).
         """
         with self._lock:
+            self._sync_if_changed()
             until = self._authorized_until
             if until == _INDEFINITE:
                 return True
@@ -183,22 +278,23 @@ class ChromeAuth:
             if isinstance(until, (int, float)) and until > now:
                 if now - self._last_used <= IDLE_LOCK_S:
                     return True
-                # Idle-locked: still inside the hard cap, but unused for over
-                # an hour. Clear it, same lazy pattern as deadline expiry.
-                self._authorized_until = None
-                self._persist()
+                # Idle-locked: grant still inside hard cap, but unused too long.
+                # Do NOT mutate - leave the grant for re-grant on next
+                # license assertion. (The next /lp tool call from the user
+                # will call require_authorized -> auto-extend, which stamps
+                # last_used and keeps the grant alive.)
                 return False
-            if until is not None:
-                # Expired, clear it so status reflects reality.
-                self._authorized_until = None
-                self._persist()
+            # Until is None or past the hard cap - locked.
             return False
 
     def require_authorized(self) -> None:
         if not self.is_authorized():
             raise ChromeAuthError(
-                f"Chrome control locked. Ask the user to run {command_hint('authorize')} "
-                "(or authorize from the extension popup) before using my_browser_* tools."
+                "Chrome control locked. Ask the user to activate their "
+                "LucidPilot licence in the extension popup (or, if it is "
+                "already active, deactivate and re-activate it - that fresh "
+                f"assertion re-grants); {command_hint('doctor')} explains why "
+                "it is locked. The agent cannot unlock it itself."
             )
         # Stamp last-use so active driving keeps the idle clock wound. Written
         # through at most once a minute: this runs on EVERY tool call, and the
@@ -209,6 +305,48 @@ class ChromeAuth:
             self._last_used = now
             if now - was > 60:
                 self._persist()
+        # Auto-extend the hard cap while the user is actively driving. Threshold
+        # of 4h left means we re-stamp at most every 20h of continuous use
+        # (default window 24h), and never on back-to-back calls - cheap, no
+        # surprise to a user who paused for a day and came back to find their
+        # grant intact. Bypassed entirely for "indefinite" grants: they have
+        # no cap to extend. Project rule (memory: lucidpilot-never-extend):
+        # the user explicitly opted out of manual Extend; this is the
+        # mechanical replacement.
+        self._extend_if_active(threshold_s=4 * 3600)
+
+    def extend_on_use(self) -> bool:
+        """Extend an active grant to now + default window. Called from the /lp
+        slash command so typing `/lp` (even before any my_browser_* call)
+        re-winds an idle-locked grant back to a full window. Returns True if
+        a grant was extended, False if there was nothing to extend (locked).
+        A grant whose hard cap already passed is NOT revived here - explicit
+        authorize() is required for that, same as before."""
+        with self._lock:
+            self._sync_if_changed()
+            until = self._authorized_until
+            if until is None or until == _INDEFINITE:
+                return False
+            self._authorized_until = time.time() + self._default_timeout_minutes * 60
+            self._last_used = time.time()
+            self._persist()
+            return True
+
+    def _extend_if_active(self, threshold_s: int) -> None:
+        """Internal: silently push the hard cap forward when close to expiry.
+        No-op for indefinite grants (they have no cap) and no-op for idle-
+        locked grants (is_authorized above already filtered those). Cheap:
+        in-memory check + occasional disk write (same throttle as last_used
+        above - only when remaining actually drops below threshold)."""
+        with self._lock:
+            until = self._authorized_until
+            if until is None or until == _INDEFINITE:
+                return
+            remaining = float(until) - time.time()
+            if remaining > threshold_s:
+                return
+            self._authorized_until = time.time() + self._default_timeout_minutes * 60
+            self._persist()
 
     def authorized_until(self) -> float | str | None:
         """Raw grant deadline for machine consumers (the bridge's /status):
@@ -221,6 +359,7 @@ class ChromeAuth:
 
     def summary(self) -> str:
         with self._lock:
+            self._sync_if_changed()
             until = self._authorized_until
         if until == _INDEFINITE:
             return "authorized indefinitely"
@@ -242,12 +381,17 @@ class ChromeAuth:
         label, until = self._parse_duration(minutes)
         if until is None:
             return (
-                "Unknown authorize duration. Use minutes (30m, 480, 8h default) "
+                "Unknown authorize duration. Use minutes (30m, 1440, 24h default) "
                 "or 'indefinite' (alias: 'yolo')."
             )
         with self._lock:
             self._authorized_until = until
             self._last_used = time.time()
+            # Explicit authorize() is an operator action - takes ownership of
+            # the grant, license-lapse no longer revokes it. Stays true
+            # until revoke() or until the grant expires and re-grant comes
+            # through the auto path.
+            self._auto_granted = False
             self._persist()
         if until == _INDEFINITE:
             return f"Browser control authorized {label}."
@@ -257,13 +401,72 @@ class ChromeAuth:
             "Survives agent restarts."
         )
 
+    def auto_authorize_from_license(self, licensed: bool) -> None:
+        """Called by the bridge whenever licence state is observed.
+
+        1.2.0 design: licence activation IS the consent moment. There is no
+        separate /lp authorize - users paid for and typed a licence key,
+        which is already a stronger signal than typing /lp authorize once.
+
+        State machine (called every time the extension pushes a new assertion):
+
+        licensed=True,  unlocked                -> grant indefinite, _auto_granted=true
+        licensed=True,  already granted (manual)-> leave alone (operator owns it)
+        licensed=True,  already granted (auto)  -> leave alone (still licensed)
+        licensed=False, unlocked                -> no-op (never was authorised)
+        licensed=False, auto-granted now        -> REVOKE (security: chargeback,
+                                                       refund, ban all kill it)
+        licensed=False, manually granted        -> leave alone (operator choice
+                                                       for a reason; license
+                                                       lapse doesn't override
+                                                       an explicit grant)
+
+        The /lp revoke path (self.revoke()) clears the auto flag and the
+        grant together. A subsequent licence re-assertion would re-grant
+        (see test_auto_authorize_from_license_after_revoke_re_grants) -
+        that's intentional: the next /lp assertion IS a fresh consent moment.
+        """
+        with self._lock:
+            # Sync first: a sibling process may have just revoked. Without
+            # this, our stale in-memory _user_revoked=False would re-grant
+            # and _persist would overwrite the revoke on disk.
+            self._sync_if_changed()
+            if licensed:
+                # KILLSWITCH: user explicitly revoked. Auto-grant is paused
+                # until the license server reports valid:false (round-trip)
+                # OR the user re-enables manually by editing auth.json.
+                if self._user_revoked:
+                    return
+                if self._authorized_until is not None:
+                    return  # already granted - do not touch (operator-owned)
+                self._authorized_until = _INDEFINITE
+                self._last_used = time.time()
+                self._auto_granted = True
+                self._persist()
+                return
+            # licensed=False path: license server revoked (refund / ban).
+            # Clear the killswitch flag too - the user can re-enable by
+            # re-subscribing. The /lp revoke flag stays until license loss.
+            if not self._auto_granted and not self._user_revoked:
+                return  # nothing to clear; both flags off
+            self._authorized_until = None
+            self._last_used = 0.0
+            self._auto_granted = False
+            self._user_revoked = False
+            self._persist()
+
     def revoke(self) -> str:
         with self._lock:
             self._authorized_until = None
+            self._last_used = 0.0
+            self._auto_granted = False
+            self._user_revoked = True
             self._persist()
         return (
-            f"Chrome control locked. Run {command_hint('authorize')} to allow "
-            "my_browser_* tools again."
+            "Chrome control locked for every session. To re-enable, "
+            "deactivate and re-activate the licence in the LucidPilot "
+            "extension popup (a fresh licence assertion is the consent "
+            "moment that re-grants)."
         )
 
     # -- helpers -----------------------------------------------------------

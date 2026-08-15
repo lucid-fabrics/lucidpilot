@@ -17,8 +17,8 @@
 
 <p align="center">
   <img alt="Licence" src="https://img.shields.io/badge/code-MIT-green">
-  <img alt="Chrome Web Store" src="https://img.shields.io/badge/Chrome_Web_Store-in_review-orange">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.1.0-blue">
+  <img alt="Chrome Web Store" src="https://img.shields.io/badge/Chrome_Web_Store-published-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.3.0-blue">
   <img alt="Works with" src="https://img.shields.io/badge/works_with-Claude_Code_·_Hermes-8A2BE2">
 </p>
 
@@ -30,7 +30,8 @@ visible and keeps it under your control:
 - **You see everything.** A glowing border marks the driven tab, a real cursor
   glides to every target, and a timestamped toast names each action as it lands.
 - **You stay in charge.** Browser control starts locked. The agent can never
-  unlock it. You authorize a session, and one command revokes it mid-flight.
+  unlock it. Activating your licence is the consent moment, and one command
+  (`/lp revoke`) locks it again mid-flight.
 - **You can prove it.** A local audit log keeps the last 500 actions,
   written by the extension itself, so a web page cannot fake the record.
 
@@ -84,29 +85,35 @@ itself is Chrome-Web-Store-only, never bundled into a plugin download.
 > (Claude Code namespaces it as `/lucidpilot:lp`, autocomplete finds it from
 > `/lp`) reports the extension connected.
 
-Approve the `lucidpilot_command` permission prompt when it appears - but do
-NOT add `my_browser_authorize` to an always-allow list: approving each
-authorization individually is the human gate that keeps the agent from
-unlocking browser control on its own.
+Approve the `lucidpilot_command` permission prompt when it appears. In
+1.2.0 licence activation is the consent moment - there is nothing to
+authorize. The `my_browser_authorize` tool still exists for one job:
+`/lp revoke` routes through it to lock Chrome control manually, so you
+will only ever see its permission prompt on an explicit revoke.
 
-### 3. Authorize a session
+### 3. Drive the browser
 
-![Locked until you say go: authorize, watch, revoke](.github/media/authorize.png)
+![Licence activation is the consent moment - no separate authorize](.github/media/authorize.png)
+
+In 1.2.0 there is no `/lp authorize` step. Activating your licence key in
+the extension popup is the consent moment for browser control: the bridge
+auto-grants Chrome control the moment a valid licence is asserted, and
+keeps it alive while you use it. `/lp status` shows the state in one line.
 
 ```
-/lp authorize            # 8 hours, auto-locking after 60 min idle
-/lp authorize 60m        # or a shorter window
-/lp authorize indefinite # until /lp revoke, no idle lock (alias: yolo)
+/lp revoke               # lock the tools instantly, mid-session
 ```
 
 > **You'll know it worked** when your agent's next browser action paints a
 > glowing border around the tab and a toast names the move.
 
-To skip typing this every session, set a standing grant in your environment:
+If you'd rather skip the licence paste entirely, an auto-grant env var
+unlocks every new bridge the moment it starts (and reads the licence
+server-side, so the licence itself is still the gate):
 
 ```
-LUCIDPILOT_AUTO_AUTHORIZE=8h         # every new session starts authorized for 8h
-LUCIDPILOT_AUTO_AUTHORIZE=indefinite # no clocks at all, same as authorize indefinite
+LUCIDPILOT_AUTO_AUTHORIZE=1          # every new session starts authorized; licence gates the tools
+LUCIDPILOT_AUTO_AUTHORIZE=indefinite # no clocks at all, only /lp revoke ends it
 ```
 
 Setting the env var IS the human consent (same power-user opt-out as
@@ -116,7 +123,7 @@ and it never extends a window that is already running.
 
 ### Making LucidPilot the default browser tool
 
-Once authorized, LucidPilot steps in front of rival browser tools
+Once licensed, LucidPilot steps in front of rival browser tools
 (claude-in-chrome, chrome-devtools, hermes-chrome-plugin's chrome_*) so your
 agent drives your real Chrome instead of a separate, signed-out one. This is
 on by default. To turn it off:
@@ -147,8 +154,9 @@ checkout and a daily licence check
 
 ## The safety model
 
-- **Locked until a human says otherwise.** Sessions are time-boxed (8 hours,
-  auto-locking after 60 minutes idle) and the agent can never authorize itself.
+- **Locked until a human says otherwise.** Licence activation is the consent
+  moment (control auto-locks after 60 minutes idle) and the agent can never
+  unlock itself.
 - **One command ends it.** `/lp revoke` locks the tools instantly, mid-session.
 - **The log is written by the extension.** A page can fake the overlay. It
   cannot fake the log.
@@ -156,7 +164,11 @@ checkout and a daily licence check
   resolves to a submit button, or a label like "Buy Now", "Place Order",
   "Pay Now", or "Checkout", shows an on-page approve/deny prompt before the
   click fires - not just an overlay you watch, one that can stop the click.
-  It denies by default: click Deny, or don't answer, and nothing happens.
+  It also activates the tab and raises a macOS notification with its own
+  Approve/Deny buttons, so you don't have to be looking at the browser to
+  catch it. It denies by default: click Deny, don't answer, or let it sit
+  for 3 minutes, and nothing happens - the agent gets back a
+  `confirm-denied` or `confirm-timeout` error, never a silent failure.
 
 ### What it does not do
 
@@ -166,7 +178,9 @@ The parts a demo will not tell you:
   submit/buy/pay pause above is the one real exception, and only when the
   agent resolved a specific element (a selector or a snapshot uid); a bare
   coordinate click skips it.
-- Sensitive domains are a build-time list, not a settings screen.
+- Sensitive domains (popup's "Sensitive sites" panel) only turn the overlay
+  red as a warning - they do not block anything, same ALARM ONLY caveat as
+  the overlay itself.
 - Chrome on the desktop only. No Edge, no Brave, no mobile.
 - It drives the browser you are signed into. That is the point, and the risk.
 
@@ -217,7 +231,7 @@ this repo holds the two agent plugins that drive it:
 bridge.py            loopback HTTP server on 127.0.0.1:16329, queues/delivers
                      commands between a Hermes/Claude Code session and the
                      extension's service worker
-auth.py               Chrome-control gate: locked by default, /lp authorize
+auth.py               Chrome-control gate: auto-grants on licence activation, /lp revoke locks
                      grants a time-boxed (or indefinite) window
 licensing.py          Pro license gate: reads the verdict the extension
                      asserts to the bridge

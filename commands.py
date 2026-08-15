@@ -4,20 +4,31 @@
 namespace so both plugins' commands don't collide when both are installed).
 
 A single command registered as ``lp`` whose handler parses the first token as
-a subcommand: ``authorize | revoke | status | doctor | onboard | background |
-license``. Handlers return plain strings (the host renders them); there is no
-terminal ``ctx.ui.confirm``: in CLI the act of typing the command is the human
-action; in web-ui an explicit UI confirm precedes the programmatic call.
+a subcommand: ``revoke | status | doctor | onboard | background | default |
+license | upgrade``. Handlers return plain strings (the host renders them);
+there is no terminal ``ctx.ui.confirm``: in CLI the act of typing the command
+is the human action; in web-ui an explicit UI confirm precedes the
+programmatic call.
+
+1.2.0 design: there is no ``authorize`` subcommand. Licence activation is the
+consent moment for browser control (see auth.auto_authorize_from_license).
+``revoke`` stays as the kill switch.
 """
 
 from __future__ import annotations
+
+import os
 
 from .auth import ChromeAuth, command_hint
 from .bridge import (
     ChromeProfileBridge,
     BridgeError,
-    HERMES_CHROME_VERSION,
+    check_plugin_update,
+    suppress_update_notice,
     CHROME_WEB_STORE_URL,
+    _compare_versions,
+    _current_extension_version,
+    _fetch_latest_release,
     extension_load_path,
     extension_version_is_known,
 )
@@ -33,13 +44,14 @@ def _help() -> str:
     return f"""\
 {cmd} - control the LucidPilot browser bridge
 
-  {cmd} authorize [30m|<minutes>|8h|indefinite]  Allow Chrome control (8h default, auto-locks after 1h idle).
-  {cmd} revoke                                    Lock Chrome control.
+  {cmd} revoke                                    Lock Chrome control (auto-granted on licence activation; idle-locks after 1h).
   {cmd} status                                    One-line: connection, auth, license, background.
   {cmd} doctor                                    Full health check.
   {cmd} onboard                                   How to install the companion Chrome extension.
   {cmd} background [on|off|toggle|status]         Whether my_browser_* switches Chrome to the tab it drives.
   {cmd} default [on|off|status]                   Whether rival browser tools redirect to my_browser_* when it's ready.
+  {cmd} upgrade                                   Update instructions for extension + plugin (re-install via plugin manager).
+  {cmd} upgrade dismiss                           Silence the startup update notice for one week.
   {cmd} license                                   Where to activate a licence (the extension popup)."""
 
 _BACKGROUND_DESC = {
@@ -69,8 +81,8 @@ def _status_summary(bridge: ChromeProfileBridge, auth: ChromeAuth) -> str:
         ext_version = version.get("extensionVersion")
         # Only compare when this install actually bundles an extension to
         # compare against - see bridge.extension_version_is_known.
-        if ext_version and extension_version_is_known() and ext_version != HERMES_CHROME_VERSION:
-            parts.append(f"⚠ Companion extension v{ext_version} (LucidPilot expects v{HERMES_CHROME_VERSION}, reload extension)")
+        if ext_version and extension_version_is_known() and ext_version != _current_extension_version():
+            parts.append(f"⚠ Companion extension v{ext_version} (LucidPilot expects v{_current_extension_version()}, reload extension)")
         else:
             parts.append("✓ Browser connected")
     except BridgeError:
@@ -86,7 +98,7 @@ def _doctor(bridge: ChromeProfileBridge, auth: ChromeAuth) -> str:
     # "LucidPilot v0.0.0-dev" is a lie on a Hermes zip install (the version is
     # simply not knowable there - no bundled extension to read it from), so
     # say that instead of printing a version nobody shipped.
-    lines = [f"LucidPilot v{HERMES_CHROME_VERSION}" if extension_version_is_known() else "LucidPilot"]
+    lines = [f"LucidPilot v{_current_extension_version()}" if extension_version_is_known() else "LucidPilot"]
     status = bridge.status()
     role = "sharing another session's connection" if status.get("mode") == "client" else "running the Chrome connection for this machine"
     lines.append(f"• This session is {role}.")
@@ -98,9 +110,14 @@ def _doctor(bridge: ChromeProfileBridge, auth: ChromeAuth) -> str:
     if auth.is_authorized():
         lines.append(f"✓ Browser control: {auth.summary()}.")
     else:
+        # 1.2.0: no /lp authorize. The only path to "unlocked" is a fresh
+        # licence assertion: activation auto-grants, and after a manual
+        # /lp revoke the killswitch clears only on a valid:false ->
+        # valid:true round-trip (deactivate + re-activate in the popup).
         lines.append(
-            f"✗ Browser control is locked. Run {command_hint('authorize')} "
-            "(or authorize from the extension popup) before using my_browser_* tools."
+            "✗ Browser control is locked. Activate a licence in the extension "
+            "popup to auto-grant; after a manual /lp revoke, deactivate and "
+            "re-activate the licence there to re-enable."
         )
 
     if licensing.is_pro_licensed():
@@ -123,10 +140,10 @@ def _doctor(bridge: ChromeProfileBridge, auth: ChromeAuth) -> str:
         latency_ms = round((_time.time() - started) * 1000)
         extension_alive = True
         ext_version = version.get("extensionVersion")
-        if ext_version and extension_version_is_known() and ext_version != HERMES_CHROME_VERSION:
+        if ext_version and extension_version_is_known() and ext_version != _current_extension_version():
             version_mismatch = True
             lines += [
-                f"✗ The companion extension is on an old version ({ext_version}); this LucidPilot is {HERMES_CHROME_VERSION}.",
+                f"✗ The companion extension is on an old version ({ext_version}); this LucidPilot is {_current_extension_version()}.",
                 "  Fix: open chrome://extensions and click the refresh icon on the LucidPilot extension.",
             ]
         else:
@@ -155,7 +172,71 @@ def _doctor(bridge: ChromeProfileBridge, auth: ChromeAuth) -> str:
     elif version_mismatch:
         lines.append("… Skipped the remaining checks until you reload the companion extension.")
 
+    # Version section (last - the rest of doctor is more urgent).
+    try:
+        latest = check_plugin_update()
+        current = _current_extension_version()
+        if latest is None:
+            lines.append(f"• Plugin version: v{current}.")
+        elif _compare_versions(current, latest["version"]) >= 0:
+            lines.append(f"✓ Plugin version: v{current} (latest).")
+        else:
+            lines.append(f"⚠ Plugin version: v{current} → v{latest['version']} available.")
+            lines.append("  Fix: run `/lp upgrade`.")
+    except Exception:
+        pass  # never break /lp doctor on a flaky update check
+
     return "\n".join(lines)
+
+
+def _upgrade() -> str:
+    """Print upgrade instructions for both the extension and the plugin.
+
+    Extension: user opens the CWS URL and Chrome handles the update in place.
+    Plugin: re-install via the plugin manager. Both channels are user-
+    controlled; we never auto-install.
+    """
+    current = _current_extension_version()
+    # Fetch the release directly rather than via check_plugin_update: that
+    # helper returns None BOTH when you are up to date AND on a network
+    # error, so _upgrade could not tell "you're current" from "offline" and
+    # wrongly told an up-to-date user the check had failed. A direct fetch
+    # disambiguates: None == genuinely unreachable; a dict == compare it.
+    if os.environ.get("LUCIDPILOT_NO_UPDATE_CHECK"):
+        latest = None
+        why = "update checks are disabled (LUCIDPILOT_NO_UPDATE_CHECK is set)"
+    else:
+        latest = _fetch_latest_release()
+        why = "could not reach the update check (offline?)"
+    if latest is None:
+        return (
+            f"Current: v{current}. The {why}, so I can't confirm whether a "
+            f"newer version exists. Manual install paths below.\n\n"
+            f"Extension (Chrome Web Store):\n  {CHROME_WEB_STORE_URL}\n\n"
+            f"Plugin:\n"
+            f"  claude plugin install https://github.com/lucid-fabrics/lucidpilot.git\n"
+            f"  hermes plugins install https://github.com/lucid-fabrics/lucidpilot.git"
+        )
+    if _compare_versions(current, latest["version"]) >= 0:
+        return f"Already on the latest version (v{current})."
+
+    notes = latest.get("notes") or ""
+    notes_block = f"\nRelease notes: {notes}\n" if notes else "\n"
+    return (
+        f"Update available: v{current} → v{latest['version']}.{notes_block}\n"
+        f"Extension (Chrome Web Store - updates in place):\n  {CHROME_WEB_STORE_URL}\n\n"
+        f"Plugin (re-install via plugin manager):\n"
+        f"  claude plugin install https://github.com/lucid-fabrics/lucidpilot.git\n"
+        f"  hermes plugins install https://github.com/lucid-fabrics/lucidpilot.git\n\n"
+        f"Release page: {latest.get('url', '')}\n\n"
+        f"To silence this notice for a week: /lp upgrade dismiss"
+    )
+
+
+def _upgrade_dismiss() -> str:
+    """Suppress the startup one-liner for one week. /lp doctor still shows status."""
+    suppress_update_notice(weeks=1)
+    return "Update notice suppressed for one week. /lp doctor still reports version status."
 
 
 def _onboard() -> str:
@@ -236,35 +317,56 @@ def register_all_commands(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) ->
     def handler(raw_args: str) -> str:
         tokens = (raw_args or "").strip().split()
         if not tokens or tokens[0] in ("help", "-h", "--help"):
+            # Even bare `/lp` (or `/lp help`) re-winds the grant. Project rule
+            # (memory: lucidpilot-never-extend): user never manually extends;
+            # typing the slash command IS the manual consent moment, so
+            # honor it. No-op when nothing is locked, so it's free.
+            auth.extend_on_use()
             return _help()
         sub, rest = tokens[0], " ".join(tokens[1:])
         try:
             if sub == "authorize":
-                return auth.authorize(rest or None)
+                # 1.2.0: removed. Licence activation auto-grants Chrome control
+                # (see auth.auto_authorize_from_license); no separate /lp
+                # authorize step. Tell the user rather than silently succeed.
+                return (
+                    "Browser control is granted automatically when a valid "
+                    "licence is activated in the extension popup. To lock it "
+                    f"manually, use `{command_hint('revoke')}`."
+                )
             if sub == "revoke":
                 return auth.revoke()
             if sub == "status":
+                auth.extend_on_use()
                 return _status_summary(bridge, auth)
             if sub == "doctor":
+                auth.extend_on_use()
                 return _doctor(bridge, auth)
             if sub == "onboard":
                 return _onboard()
             if sub == "background":
+                auth.extend_on_use()
                 return _background(bridge, rest)
             if sub == "default":
+                auth.extend_on_use()
                 return _default(rest)
             if sub == "license":
                 return _license(rest)
+            if sub == "upgrade":
+                # `upgrade dismiss` -> suppress; bare `upgrade` -> instructions.
+                if rest.strip().lower() == "dismiss":
+                    return _upgrade_dismiss()
+                return _upgrade()
         except Exception as exc:  # noqa: BLE001
             return f"[lucidpilot] {type(exc).__name__}: {exc}"
         return (
             f"Unknown subcommand '{sub}'. Try: {command_hint()} "
-            "authorize | revoke | status | doctor | onboard | background | default | license."
+            "revoke | status | doctor | onboard | background | default | license | upgrade."
         )
 
     ctx.register_command(
         "lp",
         handler=handler,
-        description="Control the LucidPilot browser bridge (authorize/revoke/status/doctor/onboard/background/default).",
-        args_hint="authorize|revoke|status|doctor|onboard|background|default",
+        description="Control the LucidPilot browser bridge (revoke/status/doctor/onboard/background/default/upgrade).",
+        args_hint="revoke|status|doctor|onboard|background|default|upgrade",
     )

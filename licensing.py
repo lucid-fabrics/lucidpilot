@@ -12,7 +12,8 @@ That inversion is sound because my_browser_* cannot function without the extensi
 anyway - it drives Chrome through it - so the extension is always present
 whenever the Python side needs a licence. The assertion is NOT taken on the
 extension's word alone: `token` is a server-signed session token (Ed25519,
-8-day expiry) minted by the licensing service on every successful verify, and
+expiring at the paid period end + grace, floor 8 days) minted by the
+licensing service on every successful verify, and
 bridge.py checks its signature itself against a pinned public key (see
 bridge._verify_license_token and the vendored ed25519_verify module). Origin
 pinning keeps foreign processes off the channel; the token keeps a tampered
@@ -194,7 +195,7 @@ def require_pro_licensed() -> None:
     if state.get("licenseAssertedValid") and state.get("licenseTokenState") in ("missing", "invalid", "expired"):
         # The extension says "licensed" but could not prove it with a
         # server-signed session token: an outdated extension (predates
-        # tokens), a token past its 8-day life (offline too long), or a
+        # tokens), a token past its expiry (offline beyond the paid period), or a
         # tampered one. All three have the same fix path for a real customer.
         raise LicenseRequiredError(
             "LucidPilot requires an active license, and the Chrome extension "

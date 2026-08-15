@@ -4,7 +4,8 @@ Two independent tool sets share this one plugin:
   * my_browser_* (chrome_tools.py, 21 tools) - drive the user's real, signed-in Chrome
     profile through LucidPilot's own companion extension + bridge.py (loopback
     HTTP, port 16329 by default). Locked by default, gated per-tool by
-    check_fn=auth.is_authorized, unlocked with /lp authorize. This is a
+    check_fn=auth.is_authorized, unlocked automatically by licence
+    activation in the extension popup (/lp revoke re-locks). This is a
     Python-side fork of hermes-chrome-plugin's own chrome_* tools, renamed to
     my_browser_* so both plugins can be installed side by side with zero tool-name or
     (after the /lp rename in commands.py) command-name collisions.
@@ -57,6 +58,7 @@ bridge.py etc. needing to be importable as a real package.
 from __future__ import annotations
 
 import os
+import sys
 
 _OTHER_PLUGIN_DIR = os.path.expanduser("~/.hermes/plugins/hermes-chrome-plugin")
 
@@ -89,7 +91,7 @@ Usage rules:
 1. my_browser_snapshot before clicking/typing; prefer the stable `uid` over `selector`.
 2. Pass includeSnapshot=true on my_browser_click/my_browser_type/my_browser_fill/my_browser_key to verify state in one round trip.
 3. my_browser_* run in the background by default; pass background=false (or /lp background off) when the user wants to watch.
-4. If a my_browser_* tool reports browser control is locked, ask the user to authorize (/lp authorize, or the UI button); the agent cannot authorize itself.
+4. If a my_browser_* tool reports browser control is locked, ask the user to activate (or deactivate and re-activate) their licence in the extension popup; the agent cannot unlock it itself.
 5. Run /lp doctor when in doubt about connectivity.
 
 my_browser_* actions paint the AI Session Indicator overlay (border/cursor/toast) automatically as part of LucidPilot's own extension; no separate indicator_* call is needed for them.
@@ -173,15 +175,11 @@ def register(ctx) -> None:
         # logging/context is wired up.
         print(
             f"[lucidpilot] tools unavailable ({exc}) - "
-            "reinstall LucidPilot, then restart your agent."
+            "reinstall LucidPilot, then restart your agent.",
+            file=sys.stderr,
         )
     else:
-        # Cosmetic overlay: licence-gated (inside indicator_tools) but not
-        # auth-gated, and not subject to the control_tools knob - it has no
-        # hermes-chrome-plugin counterpart to collide with.
-        _register_indicator_tools(ctx)
-        registered = True
-
+        bridge = None
         if register_control:
             auth = ChromeAuth()
             # auth wired in at construction so GET /status can report auth state
@@ -189,6 +187,17 @@ def register(ctx) -> None:
             # ChromeProfileBridge.auth's own comment in bridge.py for why this is
             # a plain attribute (duck-typed) rather than a ChromeAuth import.
             bridge = ChromeProfileBridge(auth=auth)
+
+        # Cosmetic overlay: licence-gated (inside indicator_tools) but not
+        # auth-gated, and not subject to the control_tools knob - it has no
+        # hermes-chrome-plugin counterpart to collide with. Shares the
+        # session's bridge when one exists so indicator_* rides the in-memory
+        # queue instead of constructing a second bridge (EADDRINUSE -> HTTP
+        # round-trip through our own server).
+        _register_indicator_tools(ctx, bridge=bridge)
+        registered = True
+
+        if register_control:
             _register_browser_tools(ctx, bridge, auth)
             register_all_commands(ctx, bridge, auth)
 

@@ -35,16 +35,44 @@ fails the real action, it's cosmetic only.
 
 from __future__ import annotations
 
+import atexit
 import json
+import threading
 from typing import Any, Callable
 
 from .licensing import is_pro_licensed, require_pro_licensed
 
 
-def _bridge():
-    """Import and start this project's own connector bridge, or raise a clear error."""
+# Standalone fallback bridge, constructed at most once per process. A fresh
+# ChromeProfileBridge per _fire call was the original shape and a real bug: in
+# a process that already owned the port, every new instance hit EADDRINUSE,
+# dropped to client mode, and round-tripped each overlay.fire over HTTP
+# through this process's OWN server. Lock-guarded: an unguarded first-call
+# race could leave a server-mode instance unreferenced but still bound.
+_standalone_bridge: Any = None
+_standalone_lock = threading.Lock()
+
+
+def _bridge(shared: Any = None):
+    """Return (bridge, timeout): the host-injected instance when one was
+    passed to register_all_tools (one bridge per process, already serving),
+    else a process-wide memoized standalone one (indicator-only sessions
+    where no other code constructs a bridge)."""
+    global _standalone_bridge
     from .bridge import ChromeProfileBridge, DEFAULT_TIMEOUT_MS  # may raise ImportError
-    b = ChromeProfileBridge()
+    b = shared
+    if b is None:
+        with _standalone_lock:
+            if _standalone_bridge is None:
+                # auth wired even here: this fallback bridge can become the
+                # PORT OWNER other sessions forward /command to (both hosts
+                # default to 16329), and an auth-less owner would skip the
+                # server-side revoke gate for every forwarded command -
+                # reopening the hole bridge.py's _handle_command closes.
+                from .auth import ChromeAuth
+                _standalone_bridge = ChromeProfileBridge(auth=ChromeAuth())
+                atexit.register(_standalone_bridge.stop)
+        b = _standalone_bridge
     b.ensure_started()
     return b, DEFAULT_TIMEOUT_MS
 
@@ -67,7 +95,7 @@ def _js(event: str, detail: dict) -> str:
     return f"document.dispatchEvent(new CustomEvent({json.dumps(event)},{{detail:{json.dumps(d)}}}))"
 
 
-def _fire(target_id: int | None, event: str, detail: dict) -> str:
+def _fire(target_id: int | None, event: str, detail: dict, shared_bridge: Any = None) -> str:
     # Runtime gate (the check_fn on registration is only a visibility hint -
     # a host that ignores it, or a stale tool list, still lands here). Raises
     # LicenseRequiredError, which _guard turns into a clear string.
@@ -82,14 +110,19 @@ def _fire(target_id: int | None, event: str, detail: dict) -> str:
             f"continue with the real action:\n{js}"
         )
     try:
-        b, timeout_ms = _bridge()
+        b, timeout_ms = _bridge(shared_bridge)
         # "overlay.fire", not "page.evaluate": a known event name + a small
         # validated detail object, never an arbitrary JS expression string.
         # glue.js validates both strictly and never license-gates this one
         # action - see bridge.py's _require_command_licensed.
+        # sessionId lets glue.js's fireOverlayEvent auto-claim a fresh
+        # background tab when no targetId was passed (matches the same
+        # auto-claim the page.* dispatch wrapper applies), so untargeted
+        # indicator_* calls don't paint on the user's currently active tab.
+        from .bridge import SESSION_ID  # same lazy pattern as _agent()
         b.send(
             "overlay.fire",
-            {"targetId": target_id, "event": event, "detail": _with_agent(detail)},
+            {"targetId": target_id, "event": event, "detail": _with_agent(detail), "sessionId": SESSION_ID},
             timeout_ms,
         )
     except Exception as e:  # bridge unreachable/not installed, bad target_id, etc.
@@ -116,7 +149,11 @@ def _guard(fn: Callable[[dict], str]) -> Callable[..., str]:
     return wrapper
 
 
-def register_all_tools(ctx, **_kw) -> None:
+def register_all_tools(ctx, bridge: Any = None, **_kw) -> None:
+    """``bridge`` is the host's already-constructed ChromeProfileBridge (the
+    same instance chrome_tools got). Optional: indicator_* also registers in
+    sessions that build no bridge at all (control_tools=never on Hermes),
+    where _bridge() falls back to its own memoized standalone instance."""
     def _licensed() -> bool:
         # Resolved at call time (module global), not captured as a direct
         # reference - same shape as chrome_tools._authorized_and_licensed, and
@@ -169,32 +206,32 @@ def register_all_tools(ctx, **_kw) -> None:
         return int(x), int(y)
 
     def h_show(args: dict) -> str:
-        return _fire(args.get("targetId"), "__claude-indicator-show", {})
+        return _fire(args.get("targetId"), "__claude-indicator-show", {}, shared_bridge=bridge)
 
     def h_hide(args: dict) -> str:
-        return _fire(args.get("targetId"), "__claude-indicator-hide", {})
+        return _fire(args.get("targetId"), "__claude-indicator-hide", {}, shared_bridge=bridge)
 
     def h_move(args: dict) -> str:
         xy = _xy(args)
         if isinstance(xy, str):
             return xy
-        return _fire(args.get("targetId"), "__claude-cursor-move", {"x": xy[0], "y": xy[1]})
+        return _fire(args.get("targetId"), "__claude-cursor-move", {"x": xy[0], "y": xy[1]}, shared_bridge=bridge)
 
     def h_click(args: dict) -> str:
         xy = _xy(args)
         if isinstance(xy, str):
             return xy
-        return _fire(args.get("targetId"), "__claude-cursor-click", {"x": xy[0], "y": xy[1]})
+        return _fire(args.get("targetId"), "__claude-cursor-click", {"x": xy[0], "y": xy[1]}, shared_bridge=bridge)
 
     def h_type(args: dict) -> str:
         xy = _xy(args)
         if isinstance(xy, str):
             return xy
-        return _fire(args.get("targetId"), "__claude-cursor-type", {"x": xy[0], "y": xy[1]})
+        return _fire(args.get("targetId"), "__claude-cursor-type", {"x": xy[0], "y": xy[1]}, shared_bridge=bridge)
 
     def h_scroll(args: dict) -> str:
         direction = args.get("direction", "down")
-        return _fire(args.get("targetId"), "__claude-cursor-scroll", {"direction": direction})
+        return _fire(args.get("targetId"), "__claude-cursor-scroll", {"direction": direction}, shared_bridge=bridge)
 
     add(
         "indicator_show",

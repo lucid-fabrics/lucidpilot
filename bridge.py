@@ -67,6 +67,7 @@ import base64
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -211,8 +212,6 @@ def read_extension_version() -> str:
     return "0.0.0-dev"
 
 
-HERMES_CHROME_VERSION = read_extension_version()
-
 # What read_extension_version() returns when there is no bundled extension to
 # read - the Hermes plugin zip ships the Python side only (the extension is a
 # separate download), so this is the NORMAL case there, not a broken install.
@@ -223,7 +222,239 @@ UNKNOWN_EXTENSION_VERSION = "0.0.0-dev"
 
 
 def extension_version_is_known() -> bool:
-    return HERMES_CHROME_VERSION != UNKNOWN_EXTENSION_VERSION
+    return _current_extension_version() != UNKNOWN_EXTENSION_VERSION
+
+
+# Per-call version lookup. Read on every use instead of caching at module
+# import: a stale bridge started before a plugin update would otherwise keep
+# reporting the old version forever, and every other Claude session that opens
+# inherits the stale number from the on-disk auth/extension state. File I/O is
+# sub-millisecond (one tiny JSON; in-process cache would buy nothing for one
+# read per /status or /next call).
+def _current_extension_version() -> str:
+    return read_extension_version()
+
+
+# ---------------------------------------------------------------------------
+# Plugin update check. Queries GitHub's public Releases API for the latest
+# published release; cache-first with a 24h TTL so the start path stays fast
+# and offline-tolerant, never blocks on the network, and never spams the
+# user when the API is rate-limited or unreachable. Designed to be safe to
+# call from any code path: it catches every exception and degrades to "no
+# notice" rather than ever raising back to the caller.
+# ---------------------------------------------------------------------------
+
+_UPDATE_CHECK_URL = "https://api.github.com/repos/lucid-fabrics/lucidpilot/releases/latest"
+_UPDATE_CHECK_TTL_S = 24 * 3600
+_UPDATE_CHECK_TIMEOUT_S = 5
+# Same directory (and same env override) as auth.py/licensing.py, so ALL
+# per-machine state lives in one inspectable dir - and so the test suite's
+# LUCIDPILOT_LICENSE_DIR redirect covers this cache too, instead of test-
+# spawned bridges reading/writing the developer's real ~/.hermes cache.
+_UPDATE_CHECK_CACHE_PATH = os.path.join(
+    os.environ.get("LUCIDPILOT_LICENSE_DIR", "~/.hermes/lucidpilot"), "version-check.json"
+)
+
+
+def _parse_version(s: str) -> tuple:
+    """Parse a semver-ish string into a comparable tuple.
+
+    Handles leading 'v' and optional '-' pre-release suffix (which sorts
+    BEFORE the same base version: 1.2.0-rc1 < 1.2.0). Anything that doesn't
+    parse as major.minor.patch falls back to (0,) so it never compares as
+    "newer" than a real release.
+    """
+    s = (s or "").strip().lstrip("v")
+    base, _, pre = s.partition("-")
+    try:
+        nums = tuple(int(p) for p in base.split("."))
+    except (ValueError, AttributeError):
+        return (0,)
+    # Pre-release marker: anything with a '-' suffix sorts BEFORE the same
+    # base. We don't compare pre-release identifiers to each other (1.2.0-rc1
+    # vs 1.2.0-rc2 is undefined here - both older than 1.2.0, and the
+    # stable-channel filter upstream in _fetch_latest_release means
+    # prereleases never even reach this compare).
+    if pre:
+        return nums + (0,)
+    return nums + (1,)
+
+
+def _compare_versions(a: str, b: str) -> int:
+    """-1 if a<b, 0 if equal, 1 if a>b. Semver-style: 1.10.0 > 1.9.0."""
+    va, vb = _parse_version(a), _parse_version(b)
+    if va < vb:
+        return -1
+    if va > vb:
+        return 1
+    return 0
+
+
+def _read_update_cache() -> dict:
+    """Read the cache file. Returns {} on missing file, JSON error, or wrong shape."""
+    path = os.path.expanduser(_UPDATE_CHECK_CACHE_PATH)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_update_cache(data: dict) -> None:
+    """Atomic write, same shape as auth._write_state: mkstemp (a FIXED .tmp
+    name let two concurrent processes clobber each other's half-written
+    JSON), makedirs 0o700 (this can be the first writer to create the
+    secret-bearing state dir on a fresh install - a default-umask 755 dir
+    would leave auth.json's directory world-listable), os.replace so a crash
+    mid-write never corrupts the cache. Best-effort: never raises."""
+    path = os.path.expanduser(_UPDATE_CHECK_CACHE_PATH)
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".version-check-", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        pass
+
+
+def _fetch_latest_release() -> dict | None:
+    """Hit GitHub Releases API once. Returns the parsed release dict or None.
+
+    - 5s timeout (worst case bound for the start path)
+    - 404 / no tag / prerelease -> None (nothing to compare against)
+    - Any network / parse error -> None
+    - Privacy: hits api.github.com with no body, no auth; GitHub sees the
+      user's IP. Acceptable for an open-source plugin's check endpoint; if
+      that ever changes, the URL is one constant above.
+    """
+    try:
+        req = urllib_request.Request(
+            _UPDATE_CHECK_URL,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "lucidpilot-update-check",
+            },
+        )
+        with urllib_request.urlopen(req, timeout=_UPDATE_CHECK_TIMEOUT_S) as resp:
+            if resp.status != 200:
+                return None
+            payload = json.loads(resp.read())
+    except (urllib_error.URLError, urllib_error.HTTPError, OSError, ValueError):
+        return None
+
+    tag = payload.get("tag_name")
+    if not tag or not isinstance(tag, str):
+        return None  # no releases published yet, or GitHub returned something weird
+    if payload.get("prerelease", False):
+        return None  # stable channel only; betas never trigger "behind"
+
+    body = payload.get("body") or ""
+    first_line = body.splitlines()[0].strip() if body else ""
+
+    return {
+        "version": tag.lstrip("v"),
+        "url": payload.get("html_url") or "",
+        "notes": first_line[:120],
+        "fetched_at": time.time(),
+    }
+
+
+def check_plugin_update(*, force: bool = False) -> dict | None:
+    """Cache-first update check.
+
+    Returns the latest-release dict if a NEWER version exists, None otherwise.
+    Used by:
+    - `_maybe_print_update_notice` at CLI startup (fire-and-forget stderr)
+    - `/lp doctor` (verbose mode, prints version status)
+    - `/lp upgrade` (decides whether to print install instructions)
+
+    Suppression (`suppress_until` in the cache) takes precedence over cache
+    age and over the live network result, so a user who has dismissed an
+    update for a week does not see it on every start.
+
+    `force=True` skips the cache TTL and re-hits the network. Used by
+    /lp upgrade so the user can opt out of the 24h cache on demand.
+    """
+    try:
+        # Hard off-switch for the CHECK path: no cache read, no cache write,
+        # no network from here. (suppress_update_notice still writes its
+        # dismissal to the cache - deliberate, it is user intent, not a
+        # check.) Set by the test suite (conftest.py) so test-spawned bridges
+        # can never hit api.github.com; also an escape hatch for air-gapped
+        # installs.
+        if os.environ.get("LUCIDPILOT_NO_UPDATE_CHECK"):
+            return None
+        now = time.time()
+        cache = _read_update_cache()
+
+        suppress_until = float(cache.get("suppress_until") or 0)
+        if suppress_until > now:
+            return None
+
+        last_checked = float(cache.get("last_checked") or 0)
+        cached_result = cache.get("last_result") if isinstance(cache.get("last_result"), dict) else None
+
+        if not force and last_checked and (now - last_checked) < _UPDATE_CHECK_TTL_S:
+            result = cached_result
+        else:
+            result = _fetch_latest_release()
+            cache["last_checked"] = now
+            cache["last_result"] = result
+            _write_update_cache(cache)
+
+        if not result:
+            return None
+
+        current = _current_extension_version()
+        if _compare_versions(current, result["version"]) >= 0:
+            return None  # current >= latest, nothing to notify
+
+        return result
+    except Exception:
+        # Never raise from the update check: a corrupt cache or a transient
+        # error must not break the bridge's start path.
+        return None
+
+
+def suppress_update_notice(weeks: int = 1) -> None:
+    """Mark the update notice as dismissed for `weeks` weeks. /lp doctor
+    will still show the version status; this only suppresses the CLI-startup
+    one-liner. User-side escape hatch when they KNOW they're behind and
+    don't want the noise every start."""
+    try:
+        cache = _read_update_cache()
+        cache["suppress_until"] = time.time() + weeks * 7 * 24 * 3600
+        _write_update_cache(cache)
+    except Exception:
+        pass
+
+
+def _maybe_print_update_notice() -> None:
+    """Fire-and-forget startup hook. Logs one stderr line if a newer release
+    exists. Never blocks, never raises, never more than one line."""
+    try:
+        result = check_plugin_update()
+        if not result:
+            return
+        current = _current_extension_version()
+        notes = result.get("notes") or ""
+        suffix = f": {notes}" if notes else ""
+        print(
+            f"[lucidpilot] v{current} → v{result['version']} available{suffix}. /lp upgrade",
+            file=sys.stderr,
+            flush=True,
+        )
+    except Exception:
+        pass
 
 
 # How long an extension licence assertion stays fresh. The extension re-asserts
@@ -338,6 +569,11 @@ class ChromeProfileBridge:
     # minute, and any assertion that changes the verdict does fire them.
     _license_change_callbacks: list = field(default_factory=list, repr=False)
     _assert_parse_warned: bool = field(default=False, repr=False)
+    # Guards the four assertion fields below plus _token_memo: writes arrive
+    # on ThreadingHTTPServer request threads while tool-handler threads read,
+    # and an unguarded update could pair a new assertion with the previous
+    # token state for one read.
+    _license_state_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     # Signed-token verdict for the CURRENT assertion: state is one of
     # "missing" | "invalid" | "ok"; claims holds the verified payload's tier
@@ -365,6 +601,14 @@ class ChromeProfileBridge:
             if self._httpd is not None or self._mode == "client":
                 return
             self._bind_server_or_client()
+            # Fire-and-forget update notice on first start of this bridge.
+            # Synchronous here is safe: the check itself is cache-first, so
+            # only the first-ever start (cold cache, offline) does a network
+            # call, and that is bounded by _UPDATE_CHECK_TIMEOUT_S (5s).
+            # Worst case: bridge start is delayed by 5s on the very first
+            # ever run on a machine with no network. After that, the 24h
+            # cache makes this a no-op.
+            _maybe_print_update_notice()
 
     def _bind_server_or_client(self) -> None:
         try:
@@ -440,6 +684,11 @@ class ChromeProfileBridge:
         token all mean "not licensed". The token requirement is what keeps
         this from being the extension's word alone - a client that merely
         POSTs valid:true no longer unlocks anything."""
+        with self._license_state_lock:
+            return self._is_licensed_locked()
+
+    def _is_licensed_locked(self) -> bool:
+        """Caller must hold _license_state_lock."""
         if self._license_asserted_at is None or not self._license_assertion:
             return False
         if (time.time() - self._license_asserted_at) > _LICENSE_ASSERT_TTL_S:
@@ -508,16 +757,38 @@ class ChromeProfileBridge:
                 print("[lucidpilot] ignoring malformed licence assertion from extension", file=sys.stderr)
             return
         was = self.is_licensed()
-        self._license_assertion = {
-            "valid": parsed.get("valid") is True,
-            "tier": parsed.get("tier") if isinstance(parsed.get("tier"), str) else None,
-            "lastCheckAt": parsed.get("lastCheckAt"),
-        }
-        # Signature check at ingest (memoized), expiry folded in at read.
-        self._license_token_state, self._license_token_claims = self._verify_license_token(
-            parsed.get("token")
-        )
-        self._license_asserted_at = time.time()
+        with self._license_state_lock:
+            self._license_assertion = {
+                "valid": parsed.get("valid") is True,
+                "tier": parsed.get("tier") if isinstance(parsed.get("tier"), str) else None,
+                "lastCheckAt": parsed.get("lastCheckAt"),
+            }
+            # Signature check at ingest (memoized), expiry folded in at read.
+            token_state, token_claims = self._verify_license_token(parsed.get("token"))
+            # Machine binding: the server signs the verifying machine's id into
+            # the token, and the extension asserts its own stored machineId
+            # alongside. A token minted for another machine (shared/stolen
+            # storage blob missing its matching machineId) is rejected here.
+            # An assertion WITHOUT a machineId (pre-binding extension) fails
+            # closed into "invalid", which surfaces the existing
+            # "update the extension" message rather than a licence refusal.
+            # Honest limit: an attacker who copies the ENTIRE storage blob
+            # copies the matching machineId too - the real ceiling on token
+            # sharing is the server-side seat limit at verify plus the token's
+            # own expiry, not this check. This closes the cheap replays only.
+            if token_state == "ok":
+                asserted_machine = parsed.get("machineId")
+                token_machine = (token_claims or {}).get("machineId")
+                if not isinstance(asserted_machine, str) or asserted_machine != token_machine:
+                    token_state, token_claims = "invalid", None
+            self._license_token_state, self._license_token_claims = token_state, token_claims
+            self._license_asserted_at = time.time()
+        # 1.2.0: licence activation IS the consent moment for browser control.
+        # No more /lp authorize - the moment the extension asserts a valid
+        # licence, grant an indefinite auth so my_browser_* tools work
+        # without any extra typing. Reversible via /lp revoke.
+        if self.auth is not None:
+            self.auth.auto_authorize_from_license(self.is_licensed())
         now = self.is_licensed()
         if was != now:
             for cb in list(self._license_change_callbacks):
@@ -536,20 +807,21 @@ class ChromeProfileBridge:
         the TTL already folded into `licensed`. `licenseAssertedAt` (epoch s,
         null before the first assertion) lets callers name the actual cause of
         a denial - key missing vs extension not reporting."""
-        claims = self._license_token_claims or {}
-        return {
-            "licensed": self.is_licensed(),
-            # The SIGNED tier outranks the asserted one - the assertion's tier
-            # is the extension's word, the claim's tier is the server's.
-            "tier": claims.get("tier") or (self._license_assertion or {}).get("tier"),
-            "licenseAssertedAt": self._license_asserted_at,
-            "licenseTokenState": self._license_token_read_state(),
-            # The extension's own (unproven) verdict, so licensing.py can tell
-            # "no key entered" (valid:false, generic message) apart from
-            # "claims a licence it cannot prove" (valid:true + token not ok -
-            # a stale or tampered extension, the update-extension message).
-            "licenseAssertedValid": (self._license_assertion or {}).get("valid") is True,
-        }
+        with self._license_state_lock:
+            claims = self._license_token_claims or {}
+            return {
+                "licensed": self._is_licensed_locked(),
+                # The SIGNED tier outranks the asserted one - the assertion's tier
+                # is the extension's word, the claim's tier is the server's.
+                "tier": claims.get("tier") or (self._license_assertion or {}).get("tier"),
+                "licenseAssertedAt": self._license_asserted_at,
+                "licenseTokenState": self._license_token_read_state(),
+                # The extension's own (unproven) verdict, so licensing.py can tell
+                # "no key entered" (valid:false, generic message) apart from
+                # "claims a licence it cannot prove" (valid:true + token not ok -
+                # a stale or tampered extension, the update-extension message).
+                "licenseAssertedValid": (self._license_assertion or {}).get("valid") is True,
+            }
 
     # -- legacy key migration ---------------------------------------------
 
@@ -619,7 +891,7 @@ class ChromeProfileBridge:
             # x-hermes-chrome-version header on /next) - lets any caller,
             # including the popup, compare it against the extension's own
             # chrome.runtime.getManifest().version without a round trip.
-            "version": HERMES_CHROME_VERSION,
+            "version": _current_extension_version(),
             # False when `version` above is UNKNOWN_EXTENSION_VERSION
             # ("0.0.0-dev") - the normal case for a Hermes-plugin-zip install,
             # which ships the Python side only, no bundled extension to read a
@@ -781,6 +1053,27 @@ def _cors_headers_for(headers) -> dict:
     }
 
 
+def _is_host_allowed(headers, port: int, bound_host: str = "") -> bool:
+    """The standard loopback-service defense against DNS rebinding.
+
+    A page on evil.com whose DNS is re-pointed at 127.0.0.1 reaches this
+    server with requests the browser labels same-origin (Sec-Fetch-Site:
+    same-origin, no Origin header), which _is_browser_origin_allowed alone
+    cannot tell apart from a real local request - but its Host header still
+    says evil.com. Every legitimate caller sends a loopback Host: the
+    extension fetches http://127.0.0.1:PORT, local processes use
+    http.client/curl against 127.0.0.1 or localhost. Reject everything else
+    before any endpoint logic runs. Missing Host (pre-HTTP/1.1) fails
+    closed - every real client here sends one. ``bound_host`` keeps a
+    non-default LUCIDPILOT_BRIDGE_HOST bind from 403ing its own clients
+    (which send Host: <bound_host>:<port>)."""
+    host = (headers.get("host") or "").strip().lower()
+    allowed = {f"127.0.0.1:{port}", f"localhost:{port}", "127.0.0.1", "localhost"}
+    if bound_host:
+        allowed.add(f"{bound_host.strip().lower()}:{port}")
+    return host in allowed
+
+
 def _is_browser_origin_allowed(headers) -> bool:
     origin = headers.get("origin") or ""
     if origin:
@@ -895,7 +1188,17 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length") or 0)
         return self.rfile.read(length).decode("utf-8") if length else ""
 
+    def _host_allowed(self) -> bool:
+        """One Host check ahead of every endpoint - see _is_host_allowed."""
+        addr = self.server.server_address
+        if _is_host_allowed(self.headers, addr[1], bound_host=str(addr[0])):
+            return True
+        self._send_json(403, {"ok": False, "error": "host not allowed"})
+        return False
+
     def do_OPTIONS(self) -> None:  # noqa: N802
+        if not self._host_allowed():
+            return
         cors = _cors_headers_for(self.headers)
         if not _is_browser_origin_allowed(self.headers):
             self._send_json(403, {"ok": False, "error": "browser origin not allowed"}, cors)
@@ -903,6 +1206,8 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True}, cors)
 
     def do_GET(self) -> None:  # noqa: N802
+        if not self._host_allowed():
+            return
         path = urlparse(self.path).path
         if path == "/status":
             self._handle_status()
@@ -916,6 +1221,8 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"}, _cors_headers_for(self.headers))
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._host_allowed():
+            return
         path = urlparse(self.path).path
         if path == "/command":
             self._handle_command()
@@ -976,6 +1283,26 @@ class _Handler(BaseHTTPRequestHandler):
         if license_error is not None:
             self._send_json(402, {"ok": False, "error": license_error})
             return
+        # Revoke killswitch, server-side. chrome_tools._send gates on auth in
+        # the CLIENT process, but /command is also reachable by client-mode
+        # sessions and bare local callers that never ran that gate. Honoring
+        # auth here means /lp revoke in any session stops every session's
+        # commands at the one chokepoint they all share. Only enforced when
+        # auth is wired (it always is in real sessions); a bare test bridge
+        # without auth keeps its licence-only behavior. overlay.fire is
+        # exempt on purpose: indicator_tools' gate is licence-only because
+        # painting an overlay is not driving the browser (see its module
+        # docstring) - a client-mode session's indicator must keep working
+        # while Chrome control is locked, same as in server mode.
+        auth = self._bridge.auth
+        if action != "overlay.fire" and auth is not None and not auth.is_authorized():
+            self._send_json(403, {"ok": False, "error": (
+                "Chrome control is locked (user revoke, idle lock, or "
+                "expired grant). A fresh licence assertion re-grants: if "
+                "this persists, deactivate and re-activate the licence in "
+                "the LucidPilot extension popup, then run /lp doctor."
+            )})
+            return
         try:
             result = self._bridge._send_local(
                 action, body.get("params") or {}, body.get("timeoutMs") or DEFAULT_TIMEOUT_MS
@@ -991,7 +1318,7 @@ class _Handler(BaseHTTPRequestHandler):
         qs = parse_qs(urlparse(self.path).query)
         self._bridge._mark_seen((qs.get("name") or [None])[0])
         command = self._bridge._take_next_command()
-        version = HERMES_CHROME_VERSION
+        version = _current_extension_version()
         headers = {**_cors_headers_for(self.headers), "x-hermes-chrome-version": version}
         if command is not None:
             payload = {
@@ -1024,10 +1351,13 @@ class _Handler(BaseHTTPRequestHandler):
         # Extension-only, stricter than _is_browser_origin_allowed on its own:
         # the Origin header must be PRESENT and a pinned chrome-extension://
         # id. A local process has no Origin (it should use /lp instead), and a
-        # web page cannot spoof Origin - so the only caller that passes is the
-        # popup, where a human clicked a button. That click is the explicit
-        # human consent auth.py's contract requires; this endpoint is the
-        # "web-ui: an explicit UI button/confirm" its docstring promised.
+        # web page cannot spoof Origin. NOTE the limits of that: a local
+        # NON-browser process can trivially forge this header with curl, so
+        # the pin proves "not a web page", not "a human clicked" - see the
+        # security audit. In 1.2.0 the popup no longer calls this endpoint at
+        # all (its auth UI was removed; licence activation is the consent
+        # moment). Kept for compatibility and for the e2e harness; the pin
+        # still keeps every web origin out.
         cors = _cors_headers_for(self.headers)
         origin = self.headers.get("origin") or ""
         if origin not in _ALLOWED_EXTENSION_ORIGINS:
