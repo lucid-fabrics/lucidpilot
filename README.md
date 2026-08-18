@@ -19,7 +19,7 @@
   <img alt="Licence" src="https://img.shields.io/badge/code-MIT-green">
   <img alt="Chrome Web Store" src="https://img.shields.io/badge/Chrome_Web_Store-published-blue">
   <img alt="Version" src="https://img.shields.io/badge/version-1.4.0-blue">
-  <img alt="Works with" src="https://img.shields.io/badge/works_with-Claude_Code_·_Hermes-8A2BE2">
+  <img alt="Works with" src="https://img.shields.io/badge/works_with-Claude_Code_·_Hermes_·_Codex-8A2BE2">
 </p>
 
 ![Watch your AI drive Chrome: glowing border, real cursor, timestamped toasts](.github/media/hero.png)
@@ -100,9 +100,44 @@ hermes plugins install https://github.com/lucid-fabrics/lucidpilot.git
 hermes gateway restart
 ```
 
+**Or Codex (OpenAI):**
+
+```
+curl -fsSL -o /tmp/lucidpilot.zip https://github.com/lucid-fabrics/lucidpilot/releases/latest/download/lucidpilot-claude-code-plugin.zip
+unzip -oq /tmp/lucidpilot.zip -d ~/.lucidpilot
+codex mcp add lucidpilot -- python3 ~/.lucidpilot/mcp_server.py
+```
+
+Same release zip as Claude Code - the MCP server inside serves any MCP
+host. Restart Codex and approve LucidPilot's tool-call prompt the first
+time a tool runs (that prompt is Codex's own approval flow, not ours).
+
+Codex has no user-defined slash commands, so there is no `/lp` there.
+Instead, install the lp skill and just type `lp status`, `lp doctor` or
+`lp revoke` as a plain message - the skill routes it to the same command
+the other agents' `/lp` runs:
+
+```
+mkdir -p ~/.codex/skills/lp
+cat > ~/.codex/skills/lp/SKILL.md <<'EOF'
+---
+name: lp
+description: LucidPilot browser-bridge control. Use when the user types "lp", "/lp", "lp status", "lp doctor", "lp revoke", or asks about LucidPilot's connection, licence, or browser-control state.
+---
+
+# LucidPilot control (lp)
+
+When the user asks for an lp command (status, doctor, license, revoke, help,
+or a bare "lp"), call the LucidPilot MCP tool `lucidpilot_command` with
+arguments `{"args": "<everything after lp, or empty string>"}` and relay the
+tool's returned text to the user exactly as-is. Do not paraphrase it, do not
+retry on error, and do not call any other tool for this.
+EOF
+```
+
 Requires `python3` on PATH and nothing else - no pip packages.
 
-Both commands install straight from
+All three install straight from
 [GitHub releases](https://github.com/lucid-fabrics/lucidpilot/releases) -
 each tag publishes the two plugin zips plus `SHA256SUMS` there for an offline
 or air-gapped install. That repo ships the plugins only: the Chrome extension
@@ -280,7 +315,8 @@ licensing.py          Pro license gate: reads the verdict the extension
 chrome_tools.py       the 21 my_browser_* tool handlers (gated on auth + license)
 indicator_tools.py    the 6 indicator_* tools (cosmetic, licence-gated)
 commands.py           the /lp slash command
-mcp_server.py         MCP stdio server: the same tools + /lp for Claude Code
+mcp_server.py         MCP stdio server: the same tools + /lp for Claude Code,
+                     Codex, or any other MCP host
 redirect_policy.py    shared policy: which rival tools redirect to
                      my_browser_*, and the /lp default on|off preference
 pretooluse_hook.py    Claude Code's PreToolUse hook entry point (Claude Code only)
@@ -316,7 +352,7 @@ GitHub release snapshot.
 The code in this repo is [MIT](LICENSE). The product is licence-gated at
 runtime: the extension and tools activate with a key from
 [pilot.lucidfabrics.com](https://pilot.lucidfabrics.com). One activation
-covers both Claude Code and Hermes on up to 3 devices, with a 14-day
+covers Claude Code, Hermes and Codex on up to 3 devices, with a 14-day
 no-questions refund.
 
 Built by [Lucid Fabrics](https://pilot.lucidfabrics.com). Support:
