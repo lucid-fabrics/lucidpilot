@@ -115,6 +115,17 @@ DEFAULT_PORT = int(os.environ.get("LUCIDPILOT_BRIDGE_PORT", "16329"))
 DEFAULT_TIMEOUT_MS = 30_000
 _NEXT_LONG_POLL_S = 25.0
 
+# How stale the extension's last poll may be before a NEW command fails
+# immediately instead of waiting out its whole timeout. The extension polls
+# every _NEXT_LONG_POLL_S, so 60s is two missed windows: silent that long
+# means gone (Chrome closed, extension disabled), not busy. Same threshold
+# _timeout_message uses to pick the "not polling" wording, on purpose - the
+# fail-fast and the timeout tell the same story.
+_POLL_STALE_MS = 60_000
+# ...and how long the FIRST ever command waits for the FIRST ever poll, when
+# the bridge has just started and the extension may still be waking up.
+_FIRST_POLL_GRACE_S = 5.0
+
 _EXTENSION_DIR = os.path.join(os.path.dirname(__file__), "chrome-extension")
 
 # Served verbatim by GET /testdrive (see the module docstring's Security
@@ -473,9 +484,11 @@ _LICENSE_ASSERT_TTL_S = 10 * 60
 # b64url(payload).b64url(sig)) into every successful /api/licenses/verify
 # response; the extension forwards it verbatim and _verify_license_token
 # below checks the signature here, offline. LUCIDPILOT_LICENSE_PUBKEY
-# overrides for the dev licensing service and for tests; production installs
-# never set it. Rotating the prod key means shipping a plugin update - by
-# design (a runtime-fetched key would let anyone re-pin it).
+# overrides for the dev licensing service and for tests, but only when
+# LUCIDPILOT_DEV is also set (see _verify_license_token); a bare export on a
+# production install is ignored, so it can't self-pin a self-signed token.
+# Rotating the prod key means shipping a plugin update - by design (a
+# runtime-fetched key would let anyone re-pin it).
 _LICENSE_PUBKEY_B64_PROD = "J4Kftnhs+ThoqqhjekV/eWo4AY+SDzWmnc1YuPGh/To="
 
 # Loaded lazily BY FILE PATH (not `import ed25519_verify`) so it works in
@@ -727,7 +740,12 @@ class ChromeProfileBridge:
             payload_b64, sig_b64 = token.split(".", 1)
             payload_bytes = self._b64url_decode(payload_b64)
             signature = self._b64url_decode(sig_b64)
-            pubkey_b64 = os.environ.get("LUCIDPILOT_LICENSE_PUBKEY") or _LICENSE_PUBKEY_B64_PROD
+            # Dev/test seam, not a supported user knob: the env pubkey is
+            # honored only when LUCIDPILOT_DEV is also set. A bare
+            # LUCIDPILOT_LICENSE_PUBKEY export on a production install is
+            # ignored, so it can't self-pin a self-signed ACTIVE token.
+            env_pubkey = os.environ.get("LUCIDPILOT_LICENSE_PUBKEY") if os.environ.get("LUCIDPILOT_DEV") else None
+            pubkey_b64 = env_pubkey or _LICENSE_PUBKEY_B64_PROD
             public_key = base64.b64decode(pubkey_b64)
             if _ed25519().verify(public_key, payload_bytes, signature):
                 payload = json.loads(payload_bytes)
@@ -925,36 +943,80 @@ class ChromeProfileBridge:
         return self._send_local(action, params or {}, timeout_ms)
 
     def _send_local(self, action: str, params: dict, timeout_ms: int) -> Any:
+        # Dead extension, dead air: with Chrome closed a click used to sit here
+        # for its whole 200s timeout only to end with the very message we can
+        # already give. If the extension has been silent past _POLL_STALE_MS,
+        # say so now and don't even queue the command.
+        poll_age = self._poll_age_ms()
+        if poll_age is not None and poll_age > _POLL_STALE_MS:
+            raise BridgeError(self._not_polling_message("Not sent"))
         command = BridgeCommand(id=uuid.uuid4().hex, action=action, params=params)
         future: Future = Future()
         with self._cond:
             self._pending[command.id] = _Pending(command=command, future=future)
             self._queue.append(command)
             self._cond.notify()
+        timeout_s = timeout_ms / 1000
+        if poll_age is None:
+            # Never polled: the bridge may have started a second ago with the
+            # extension's first poll already in flight, so a short grace here
+            # instead of the full timeout. The command is queued FIRST, and the
+            # grace is spent waiting on the future rather than sleeping, so a
+            # first poll landing at 0.2s picks it up at 0.2s and a fast result
+            # returns immediately - the 5s is a ceiling, never a delay.
+            grace = min(_FIRST_POLL_GRACE_S, timeout_s)
+            try:
+                return future.result(timeout=grace)
+            except FuturesTimeout:
+                if self._last_seen_at is None:
+                    self._drop_pending(command.id)
+                    raise BridgeError(self._not_polling_message("Not sent")) from None
+            timeout_s -= grace
         try:
-            return future.result(timeout=timeout_ms / 1000)
+            return future.result(timeout=timeout_s)
         except FuturesTimeout:
-            with self._cond:
-                entry = self._pending.pop(command.id, None)
-                self._queue = [c for c in self._queue if c.id != command.id]
-            raise BridgeError(self._timeout_message(entry, timeout_ms))
+            raise BridgeError(self._timeout_message(self._drop_pending(command.id), timeout_ms))
+
+    def _drop_pending(self, command_id: str) -> Optional[_Pending]:
+        """Un-queue a command that will never be answered; returns its entry
+        (delivered_at and all) so the caller can word the failure."""
+        with self._cond:
+            entry = self._pending.pop(command_id, None)
+            self._queue = [c for c in self._queue if c.id != command_id]
+        return entry
+
+    def _poll_age_ms(self) -> Optional[float]:
+        """Age of the extension's last poll in ms, None if it never polled.
+        _last_seen_at is written unlocked on request threads (_mark_seen) and
+        read unlocked everywhere else (`connected`, status()); a plain
+        attribute read is atomic and no caller needs more than a snapshot, so
+        this reads it the same way."""
+        last = self._last_seen_at
+        return None if last is None else (time.time() - last) * 1000
+
+    def _not_polling_message(self, lead: str) -> str:
+        """The one place the extension-is-gone wording lives: both the
+        fail-fast in _send_local and _timeout_message's not-polling branch say
+        this, differing only in how the failure is introduced."""
+        poll_age = self._poll_age_ms()
+        seen = "never" if poll_age is None else f"{round(poll_age / 1000)}s ago"
+        return (
+            f"{lead}: the Chrome extension is not polling (last seen {seen}). Ask the user to "
+            "run /lp onboard to install the companion extension and to keep that browser "
+            "window open."
+        )
 
     def _timeout_message(self, entry: Optional[_Pending], timeout_ms: int) -> str:
-        poll_age = None if self._last_seen_at is None else (time.time() - self._last_seen_at) * 1000
         if entry is not None and entry.delivered_at:
             return (
                 f"Timed out after {timeout_ms}ms: the Chrome extension received the command but "
                 "never returned a result. The action may be long-running, or the result post "
-                "failed. Run the /lp doctor command; if it persists, reload the LucidPilot Chrome "
-                "extension at chrome://extensions."
+                "failed. Ask the user to run /lp doctor; if it persists, they should reload the "
+                "LucidPilot Chrome extension at chrome://extensions."
             )
-        if poll_age is None or poll_age > 60_000:
-            seen = "never" if poll_age is None else f"{round(poll_age / 1000)}s ago"
-            return (
-                f"Timed out after {timeout_ms}ms: the Chrome extension is not polling (last seen "
-                f"{seen}). Run /lp onboard, then load the bundled chrome-extension folder in "
-                "your normal Chrome profile and keep that browser window open."
-            )
+        poll_age = self._poll_age_ms()
+        if poll_age is None or poll_age > _POLL_STALE_MS:
+            return self._not_polling_message(f"Timed out after {timeout_ms}ms")
         return (
             f"Timed out after {timeout_ms}ms: the Chrome extension is polling (last seen "
             f"{round(poll_age / 1000)}s ago) but did not pick up this command in time. Retry; if "

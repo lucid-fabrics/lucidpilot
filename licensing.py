@@ -199,15 +199,15 @@ def require_pro_licensed() -> None:
         # tampered one. All three have the same fix path for a real customer.
         raise LicenseRequiredError(
             "LucidPilot requires an active license, and the Chrome extension "
-            "reported one it could not prove. Update the extension to this "
-            "release, then open chrome://extensions and click the refresh icon "
-            "on it. If it is already current, reconnect to the internet so the "
-            "licence can re-verify, then retry."
+            "reported one it could not prove. Ask the user to update the "
+            "extension to this release (chrome://extensions, refresh icon), or "
+            "if it is already current, to reconnect to the internet so the "
+            "licence can re-verify. Then retry."
         )
     raise LicenseRequiredError(
-        "LucidPilot requires an active license. Enter your licence key in the "
-        f"LucidPilot Chrome extension popup. Subscribe at {PURCHASE_URL} if you "
-        "don't have one."
+        "LucidPilot requires an active license. Ask the user to enter their "
+        "licence key in the LucidPilot Chrome extension popup, or to subscribe "
+        f"at {PURCHASE_URL} if they don't have one."
     )
 
 

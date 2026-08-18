@@ -16,15 +16,18 @@ Vendored files:
 | `auth.py` | `auth.py` |
 | `commands.py` | `commands.py` |
 | `formatters.py` | `formatters.py` |
-| `chrome_tools.py` | `tools.py` (renamed; `chrome_*` tools renamed to `lp_*`) |
+| `chrome_tools.py` | `tools.py` (renamed; `chrome_*` tools renamed to `my_browser_*`) |
 | `chrome-extension/vendor/control.js` | `chrome-extension/service_worker.js` |
 | `chrome-extension/vendor/snapshot_injected.js` | `chrome-extension/snapshot_injected.js` |
 
-`chrome-extension/vendor/UPSTREAM.md` documents the one intentional
-deviation from upstream (`control.js`'s `BRIDGE_URL` override) and how to
-reapply it on a future re-vendor. All other files above are otherwise
-unmodified or renamed-only ports, as noted in each file's own header
-comment.
+`chrome-extension/vendor/UPSTREAM.md` documents three intentional
+deviations from upstream (`control.js`'s `BRIDGE_URL` override, its
+per-action timeout override and a `DOM.getDocument` priming fix for a file
+upload bug) and how to reapply each on a future re-vendor. The JavaScript
+files above (`control.js`, `snapshot_injected.js`) are otherwise unmodified
+or renamed-only ports, as noted in each file's own header comment. The
+Python files have been substantially rewritten beyond renaming, not just
+ported.
 
 ---
 

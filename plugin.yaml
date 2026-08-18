@@ -1,5 +1,5 @@
 name: lucidpilot
-version: "1.3.0"
+version: "1.4.0"
 description: >-
   Drives the user's real, signed-in Chrome profile through LucidPilot's own
   companion Chrome extension over a loopback bridge (port 16329 by default):

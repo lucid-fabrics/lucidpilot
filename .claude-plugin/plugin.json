@@ -1,6 +1,6 @@
 {
   "name": "lucidpilot",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Drive your real, signed-in Chrome from Claude Code: 21 my_browser_* browser-control tools and 6 indicator_* overlay tools, all licence-gated, plus the /lp command for status/doctor/license/revoke. Requires python3 only - no pip packages.",
   "author": { "name": "Wassim Mehanna" },
   "hooks": {

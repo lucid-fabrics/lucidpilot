@@ -69,6 +69,13 @@ _WAIT_KINDS = ["selector", "expression"]
 def _err(msg: str) -> str:
     # "[lucidpilot]" (not "[chrome]") so an error surfaced by these tools is never
     # mistaken for one from the coexisting original hermes-chrome-plugin.
+    # Two rewrites at this chokepoint (every tool error passes through here):
+    # vendored control.js still names its upstream tools (chrome_snapshot,
+    # chrome_tab) which do not exist in this product, and typed [lucidpilot:*]
+    # errors from glue.js must not pick up a second prefix.
+    msg = msg.replace("chrome_snapshot", "my_browser_snapshot").replace("chrome_tab list", "my_browser_tab action=list")
+    if msg.startswith("[lucidpilot"):
+        return msg
     return f"[lucidpilot] {msg}"
 
 
@@ -448,12 +455,17 @@ def register_all_tools(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> No
 
     add(
         "my_browser_type",
-        "Focus an optional snapshot uid or CSS selector, then type text using Chrome's real keyboard input.",
+        "Focus an optional snapshot uid or CSS selector, then type text using Chrome's real keyboard input. "
+        "Text longer than 200 characters is bulk-inserted in one trusted call (paste) automatically.",
         {
             "text": {"type": "string"},
             "uid": {"type": "string", "description": "Stable element uid from my_browser_snapshot."},
             "selector": {"type": "string", "description": "CSS selector to focus before typing."},
             "pressEnter": {"type": "boolean"},
+            "paste": {
+                "type": "boolean",
+                "description": "Insert the whole text in one trusted CDP Input.insertText call (fast, emoji-safe, works in rich editors like Reddit's Lexical) instead of per-key typing. Auto-enabled when text exceeds 200 characters; pass false to force per-key typing.",
+            },
             **_snapshot_extra_props(),
             **_target_props(),
             **_bg_prop(),
@@ -472,12 +484,17 @@ def register_all_tools(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> No
 
     add(
         "my_browser_fill",
-        "Set the full value of a text input, textarea, or contenteditable using Chrome click/select/delete/type. Pass submit=true to press Enter after.",
+        "Set the full value of a text input, textarea, or contenteditable using Chrome click/select/delete/type. Pass submit=true to press Enter after. "
+        "Text longer than 200 characters is bulk-inserted in one trusted call (paste) automatically.",
         {
             "text": {"type": "string"},
             "uid": {"type": "string", "description": "Stable element uid from my_browser_snapshot."},
             "selector": {"type": "string", "description": "CSS selector to fill if uid is omitted."},
             "submit": {"type": "boolean", "description": "Press Enter after filling."},
+            "paste": {
+                "type": "boolean",
+                "description": "Insert the whole text in one trusted CDP Input.insertText call (fast, emoji-safe, works in rich editors like Reddit's Lexical) instead of per-key typing. Auto-enabled when text exceeds 200 characters; pass false to force per-key typing.",
+            },
             "domFallback": {"type": "boolean", "description": "Fall back to DOM value-setting if CDP input is blocked (default true)."},
             **_snapshot_extra_props(),
             **_target_props(),
@@ -529,7 +546,7 @@ def register_all_tools(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> No
         {
             "kind": {"type": "string", "enum": _WAIT_KINDS},
             "value": {"type": "string", "description": "CSS selector when kind=selector; JS expression when kind=expression."},
-            "timeoutMs": {"type": "number", "description": "Default 10000."},
+            "timeoutMs": {"type": "number", "description": "Default 10000, up to ~120s."},
             "intervalMs": {"type": "number", "description": "Default 250."},
             **_target_props(),
         },
@@ -573,7 +590,7 @@ def register_all_tools(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> No
     def h_screenshot(args: dict) -> str:
         fmt = args.get("format") or "png"
         cwd = os.getcwd()
-        default_dir = os.path.join(cwd, ".hermes-chrome-screenshots")
+        default_dir = os.path.join(cwd, ".lucidpilot-screenshots")
         stamp = time.strftime("%Y-%m-%dT%H-%M-%S")
         out_path = os.path.abspath(args.get("path")) if args.get("path") else os.path.join(default_dir, f"{stamp}.{fmt}")
         timeout = 120_000 if args.get("fullPage") else DEFAULT_TIMEOUT_MS
@@ -607,7 +624,7 @@ def register_all_tools(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> No
         "my_browser_screenshot",
         "Capture a screenshot of an existing Chrome tab and save it to disk. The target tab is briefly activated within its window for the capture, then restored.",
         {
-            "path": {"type": "string", "description": "Output path. Defaults to .hermes-chrome-screenshots/<timestamp>.<format>."},
+            "path": {"type": "string", "description": "Output path. Defaults to .lucidpilot-screenshots/<timestamp>.<format>."},
             "format": {"type": "string", "enum": _IMAGE_FORMATS},
             "quality": {"type": "number", "description": "JPEG quality 0-100."},
             "fullPage": {"type": "boolean", "description": "Best-effort full-page tiles (viewport capture if unsupported)."},
@@ -699,7 +716,10 @@ def register_all_tools(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> No
     def h_upload(args: dict) -> str:
         cwd = os.getcwd()
         paths = [os.path.abspath(os.path.join(cwd, p)) for p in (args.get("paths") or [])]
-        _send(auth, bridge, "page.upload", _wire(bridge, {**args, "paths": paths}))
+        # Uploads always pause for the human's approval (extension layer 7), so
+        # they get the same long ceiling as confirmed clicks - the 30s default
+        # would kill the command while the user is still deciding.
+        _send(auth, bridge, "page.upload", _wire(bridge, {**args, "paths": paths}), _CLICK_TIMEOUT_MS)
         return f"Uploaded {len(paths)} file(s) to {args.get('uid') or args.get('selector')}"
 
     add(

@@ -26,9 +26,13 @@ A grant carries two clocks, both lazy:
   * the hard cap - the deadline set at authorize time (default 24 hours);
   * the idle lock - IDLE_LOCK_S (1 hour) since the last actual use.
 ``require_authorized`` stamps last-use on every successful call, so an agent
-actively driving Chrome never idle-locks; only true inactivity does. A grant of
-``indefinite`` is an explicit power-user opt-out and skips BOTH clocks -
-idle-locking it would make the word a lie.
+actively driving Chrome never idle-locks; only true inactivity does. The
+default licence auto-grant (auto_authorize_from_license) has no hard cap but
+STILL idle-locks after IDLE_LOCK_S unused, so an abandoned session cannot keep
+driving. Only an explicit power-user opt-out (``LUCIDPILOT_AUTO_AUTHORIZE=
+indefinite``, or ``authorize 'indefinite'``) skips both clocks; those grants
+are ``_auto_granted`` False, which is how is_authorized/summary tell the two
+apart.
 
 The grant PERSISTS across processes (``~/.hermes/lucidpilot/auth.json``).
 It used to be memory-only, which meant every agent restart - and each restart
@@ -272,9 +276,19 @@ class ChromeAuth:
         with self._lock:
             self._sync_if_changed()
             until = self._authorized_until
-            if until == _INDEFINITE:
-                return True
             now = time.time()
+            if until == _INDEFINITE:
+                # A licence auto-grant (_auto_granted) has no hard cap but DOES
+                # idle-lock: require_authorized stamps _last_used on every tool
+                # call, so active driving keeps the session alive and only true
+                # inactivity past IDLE_LOCK_S locks it (an abandoned session
+                # cannot keep driving). An explicit power-user opt-out
+                # (LUCIDPILOT_AUTO_AUTHORIZE=indefinite, or authorize
+                # 'indefinite'; _auto_granted False) keeps the original
+                # no-clocks meaning.
+                if self._auto_granted:
+                    return now - self._last_used <= IDLE_LOCK_S
+                return True
             if isinstance(until, (int, float)) and until > now:
                 if now - self._last_used <= IDLE_LOCK_S:
                     return True
@@ -361,8 +375,15 @@ class ChromeAuth:
         with self._lock:
             self._sync_if_changed()
             until = self._authorized_until
+            auto = self._auto_granted
+            idle_s = time.time() - self._last_used
         if until == _INDEFINITE:
-            return "authorized indefinitely"
+            if not auto:
+                return "authorized indefinitely"
+            # Licence auto-grant: no hard cap, idle-locks after IDLE_LOCK_S.
+            if idle_s <= IDLE_LOCK_S:
+                return f"authorized (idle-locks after {IDLE_LOCK_S // 60} min unused)"
+            return "idle-locked (re-activate the licence to resume)"
         if isinstance(until, (int, float)):
             remaining = until - time.time()
             if remaining > 0:

@@ -18,7 +18,7 @@
 <p align="center">
   <img alt="Licence" src="https://img.shields.io/badge/code-MIT-green">
   <img alt="Chrome Web Store" src="https://img.shields.io/badge/Chrome_Web_Store-published-blue">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.3.0-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.4.0-blue">
   <img alt="Works with" src="https://img.shields.io/badge/works_with-Claude_Code_·_Hermes-8A2BE2">
 </p>
 
@@ -38,6 +38,33 @@ visible and keeps it under your control:
 It drives the Chrome profile you are already signed into, over the Chrome
 DevTools Protocol. Not a headless copy, no separate browser.
 
+## Why not Playwright MCP or Browser MCP?
+
+They are good tools and they are free. Browser MCP already drives your
+logged-in Chrome. Playwright MCP and chrome-devtools MCP can too, once you
+start Chrome with a debug port. If you just want the automation, use one of
+them.
+
+LucidPilot is the layer for when the browser you are handing over is signed
+into your bank, your email and your work:
+
+- **You watch it happen.** A border, a cursor and a toast paint in the real
+  window as each action fires. The free tools drive silently.
+- **You keep the receipts.** The extension logs your last 500 actions for you
+  to read. A page can fake the overlay but not that log.
+- **Money-moving clicks pause.** Submit, buy and pay clicks stop for an
+  on-page prompt and an OS notification before they go through.
+- **It waits for the page.** It checks the target is really on screen before
+  acting and waits for a slow field to appear, so a late-painting input
+  (LinkedIn does this) gets typed once it is there, not clicked at empty space.
+
+Unlike Claude in Chrome, which blocks whole categories of sites for
+everyone, LucidPilot blocks nothing by default: your bank, Stripe and a
+broker dashboard are all fair game until you flag a domain yourself.
+
+You are paying for the watching and the record, not the ability to drive
+Chrome. If that trade is not worth $2.99, the free tools are genuinely fine.
+
 ## Quickstart
 
 Three steps. Each one tells you what success looks like.
@@ -46,7 +73,7 @@ Three steps. Each one tells you what success looks like.
 
 Install from the
 [Chrome Web Store](https://chromewebstore.google.com/detail/bfebfknclgjglelmlocldhnjkpngelfl)
-(listing in review - it goes live at that link the moment Google approves it).
+(live now, no review wait).
 
 > **You'll know it worked** when a new LucidPilot icon appears in your toolbar.
 > Click it any time for the session log, the test-drive demo, and health checks.
@@ -85,8 +112,8 @@ itself is Chrome-Web-Store-only, never bundled into a plugin download.
 > (Claude Code namespaces it as `/lucidpilot:lp`, autocomplete finds it from
 > `/lp`) reports the extension connected.
 
-Approve the `lucidpilot_command` permission prompt when it appears. In
-1.2.0 licence activation is the consent moment - there is nothing to
+Approve the `lucidpilot_command` permission prompt when it appears.
+Licence activation is the consent moment: there is nothing to
 authorize. The `my_browser_authorize` tool still exists for one job:
 `/lp revoke` routes through it to lock Chrome control manually, so you
 will only ever see its permission prompt on an explicit revoke.
@@ -95,7 +122,7 @@ will only ever see its permission prompt on an explicit revoke.
 
 ![Licence activation is the consent moment - no separate authorize](.github/media/authorize.png)
 
-In 1.2.0 there is no `/lp authorize` step. Activating your licence key in
+There is no `/lp authorize` step. Activating your licence key in
 the extension popup is the consent moment for browser control: the bridge
 auto-grants Chrome control the moment a valid licence is asserted, and
 keeps it alive while you use it. `/lp status` shows the state in one line.
@@ -143,13 +170,19 @@ One licence unlocks everything - both halves, both integrations.
 | A real cursor that glides, then marks what it hit | Click, type, fill, scroll, drag, upload |
 | Action toasts, color-coded per agent | Navigate, wait, launch |
 | Local session log: 500 actions, timestamped | Snapshot, screenshot, find, inspect |
-| Red alert border on flagged sensitive domains | Console and network inspection |
+| Flagged sensitive domains: agent fully blocked, red border | Console and network inspection |
 
 ![Every action logged locally: 500 entries, timestamped, never leaves your device](.github/media/audit-log.png)
 
 The log never records what was typed, only that typing happened. It never
-leaves your device: no analytics, no telemetry. The only network calls are
-checkout and a daily licence check
+leaves your device: no analytics, no telemetry. LucidPilot makes four kinds
+of outbound call, all to first-party or public endpoints: checkout/billing
+to pilot.lucidfabrics.com when you buy or manage a licence, a licence check
+and a paywall pricing fetch to api.lucidfabrics.com (the licence check runs
+about once a day and sends your licence key and a device identifier) and a
+version check about once a day against GitHub's public releases API
+(api.github.com), cached for 24 hours, which reveals only your IP to
+GitHub. None of the four carry analytics, page content or typed data
 ([privacy policy](https://pilot.lucidfabrics.com/privacy)).
 
 ## The safety model
@@ -164,23 +197,32 @@ checkout and a daily licence check
   resolves to a submit button, or a label like "Buy Now", "Place Order",
   "Pay Now", or "Checkout", shows an on-page approve/deny prompt before the
   click fires - not just an overlay you watch, one that can stop the click.
-  It also activates the tab and raises a macOS notification with its own
-  Approve/Deny buttons, so you don't have to be looking at the browser to
-  catch it. It denies by default: click Deny, don't answer, or let it sit
-  for 3 minutes, and nothing happens - the agent gets back a
-  `confirm-denied` or `confirm-timeout` error, never a silent failure.
+  It also activates the tab and shows an on-page prompt (and an OS
+  notification on macOS) with its own Approve/Deny buttons, so you don't
+  have to be looking at the browser to catch it. It denies by default:
+  click Deny, don't answer or let it sit for 3 minutes and nothing
+  happens - the agent gets back a `confirm-denied` or `confirm-timeout`
+  error, never a silent failure. The popup's "Approval prompts" toggle
+  (YOLO mode) turns this pause off: flip it and submit/buy/pay clicks go
+  straight through with no confirm at all.
+- **Flag a domain and the agent is locked out of it, full stop.** By default
+  LucidPilot blocks no sites. Add a domain to the popup's "Sensitive sites"
+  list and every read and every action is refused there, including
+  subdomains (`mybank.com` covers `login.mybank.com`), and it is not
+  bypassed by YOLO mode. The red overlay is the visible warning; the block
+  itself is enforced in the service worker, above CDP dispatch. Unflag the
+  domain in the popup to allow the agent again.
 
 ### What it does not do
 
 The parts a demo will not tell you:
 
 - The overlay itself cannot stop an agent - it's a window, not a lock. The
-  submit/buy/pay pause above is the one real exception, and only when the
-  agent resolved a specific element (a selector or a snapshot uid); a bare
-  coordinate click skips it.
-- Sensitive domains (popup's "Sensitive sites" panel) only turn the overlay
-  red as a warning - they do not block anything, same ALARM ONLY caveat as
-  the overlay itself.
+  submit/buy/pay pause and the sensitive-domain block above are the two real
+  exceptions and both now catch a bare coordinate click too: the gate
+  resolves what's actually under the point before deciding whether to
+  pause. The one place nothing pauses is `my_browser_evaluate` - it runs
+  page JavaScript directly, with no confirm at all.
 - Chrome on the desktop only. No Edge, no Brave, no mobile.
 - It drives the browser you are signed into. That is the point, and the risk.
 
@@ -263,6 +305,9 @@ licence check is stdlib-only (`ed25519_verify.py`) - no pip packages.
 ```bash
 python3 -m pytest tests/python/
 ```
+
+The `tests/` directory lives in the source repo, not in the published
+GitHub release snapshot.
 
 </details>
 

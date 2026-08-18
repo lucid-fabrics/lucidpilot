@@ -86,7 +86,10 @@ def _status_summary(bridge: ChromeProfileBridge, auth: ChromeAuth) -> str:
         else:
             parts.append("✓ Browser connected")
     except BridgeError:
-        parts.append("✗ Browser not responding")
+        # A first-time user hits this before ever installing the extension;
+        # the state fields below read as jargon, so lead with the fix the
+        # doctor already knows instead of leaving a bare failure.
+        parts.append("✗ Browser not responding → run /lp onboard to install the companion extension")
     parts.append(f"auth: {auth.summary()}")
     parts.append(f"license: {licensing.license_status_summary()}")
     parts.append(f"background: {'on' if bridge.background_default else 'off'}")
