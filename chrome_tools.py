@@ -18,7 +18,6 @@ through the bridge, and formats the result for the model.
 
 from __future__ import annotations
 
-import base64
 import os
 import time
 from typing import Any, Callable
@@ -28,6 +27,7 @@ from .auth import ChromeAuth, ChromeAuthError
 from .bridge import ChromeProfileBridge, BridgeError, DEFAULT_TIMEOUT_MS, CHROME_WEB_STORE_URL, extension_load_path
 from .formatters import (
     MAX_ELEMENTS,
+    decode_data_url,
     format_chrome_inspect,
     format_chrome_snapshot,
     format_included_snapshot_text,
@@ -135,7 +135,10 @@ def _send(auth: ChromeAuth, bridge: ChromeProfileBridge, action: str, params: di
     # sessions off each other's tab: unlike agent, it's unique per PROCESS,
     # so two simultaneous Claude Code sessions carry two different values.
     params = {**params, "agent": bridge_module.AGENT, "sessionId": bridge_module.SESSION_ID}
-    return bridge.send(action, params, timeout_ms)
+    # remotable: this is an agent tool call, so it is one of the commands a
+    # remote assist session is for. bridge.send() ignores the flag unless this
+    # process is currently helping someone.
+    return bridge.send(action, params, timeout_ms, remotable=True)
 
 
 def _guard(fn: Callable[[dict], str]) -> Callable[..., str]:
@@ -272,7 +275,11 @@ def register_all_tools(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> No
         "my_browser_tab",
         "List, create, activate, close, group, ungroup, or inspect tabs in the user's existing Chrome profile.",
         {
-            "action": {"type": "string", "enum": _TAB_ACTIONS},
+            "action": {
+                "type": "string",
+                "enum": _TAB_ACTIONS,
+                "description": "activate SWITCHES the tab the user is looking at in Chrome - only when they asked to bring one up, never as session setup. To drive a tab silently (session start, adopting an already-open page), pass its targetId to page actions instead; driving never needs activation.",
+            },
             "url": {"type": "string", "description": "URL for action=new."},
             "targetId": {"type": "string", "description": "Chrome tab id for activate/close/group/ungroup."},
             "urlIncludes": {"type": "string", "description": "Match the target tab by URL substring."},
@@ -596,10 +603,7 @@ def register_all_tools(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> No
         timeout = 120_000 if args.get("fullPage") else DEFAULT_TIMEOUT_MS
         result = _send(auth, bridge, "page.screenshot", _wire(bridge, args), timeout)
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-        def _decode(data_url: str) -> bytes:
-            comma = data_url.find(",")
-            return base64.b64decode(data_url[comma + 1:] if comma >= 0 else data_url)
+        _decode = decode_data_url
 
         if isinstance(result, dict) and result.get("fullPage") and result.get("tiles") and result.get("dimensions"):
             dims = result["dimensions"]
@@ -622,7 +626,7 @@ def register_all_tools(ctx, bridge: ChromeProfileBridge, auth: ChromeAuth) -> No
 
     add(
         "my_browser_screenshot",
-        "Capture a screenshot of an existing Chrome tab and save it to disk. The target tab is briefly activated within its window for the capture, then restored.",
+        "Capture a screenshot of an existing Chrome tab and save it to disk. Captured over the debugger channel, so background tabs are photographed without being brought forward or disturbing what the user is looking at.",
         {
             "path": {"type": "string", "description": "Output path. Defaults to .lucidpilot-screenshots/<timestamp>.<format>."},
             "format": {"type": "string", "enum": _IMAGE_FORMATS},

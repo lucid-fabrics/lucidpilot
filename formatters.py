@@ -8,12 +8,21 @@ Chrome extension; as long as the extension is unchanged, this output is stable.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 from typing import Any
 
 MAX_TEXT_CHARS = 30_000
 MAX_ELEMENTS = 80
+
+
+def decode_data_url(data_url: str) -> bytes:
+    """Bytes from a ``data:`` URL (or bare base64) - the {dataUrl} shape both
+    page.screenshot and app.screenshot return; shared so the two screenshot
+    handlers cannot drift."""
+    comma = data_url.find(",")
+    return base64.b64decode(data_url[comma + 1:] if comma >= 0 else data_url)
 
 _WS_RE = re.compile(r"\s+")
 # C0/C1 control chars, DEL, and Unicode bidi overrides/isolates. The snapshot
@@ -235,7 +244,12 @@ def format_chrome_snapshot(snapshot: Any) -> str:
             if snapshot.get("textTruncated"):
                 lines.append("- … page text truncated; retry with mode=text or maxTextChars for more")
 
-    lines.append("\nTip: use my_browser_snapshot({query:'...', mode:'interactive|forms|pageMap|text|changes|full'}) or nearUid to zoom in.")
+    # The Mac helper reuses this formatter but has a different tool + modes;
+    # it marks its payloads with surface="app" so the tip points the right way.
+    if snapshot.get("surface") == "app":
+        lines.append("\nTip: use my_app_snapshot({query:'...', mode:'interactive|text|full'}) or nearUid to zoom in.")
+    else:
+        lines.append("\nTip: use my_browser_snapshot({query:'...', mode:'interactive|forms|pageMap|text|changes|full'}) or nearUid to zoom in.")
     return truncate_text("\n".join(lines))
 
 

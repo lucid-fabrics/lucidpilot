@@ -142,7 +142,9 @@ Reach for my_browser_* first, ahead of any other browser tool, whenever the task
 
 Most web work is NOT a browser task, and my_browser_* is the wrong reflex for it. A research question - "how do people do X", "what's the best way to Y", anything answerable from public pages - belongs to the web search/fetch tools; they read many sources in the time one browser drives to one. Reading a single public page is likewise cheaper without a browser, and anything that must not touch the user's session belongs in a sandboxed browser. Reach for my_browser_* when the task needs THEIR browser, not for every link.
 
-Browser control unlocks automatically when the user activates their LucidPilot licence in the extension popup - the agent cannot grant itself access, and /lp revoke locks it again at any time. If the my_browser_* tools are missing entirely, the licence or the extension is the reason; /lp doctor says which."""
+Browser control unlocks automatically when the user activates their LucidPilot licence in the extension popup - the agent cannot grant itself access, and /lp revoke locks it again at any time. If the my_browser_* tools are missing entirely, the licence or the extension is the reason; /lp doctor says which.
+
+On a Mac with the LucidPilot helper app running, the my_app_* tools additionally drive native macOS apps (Mail, Xcode, Finder, Notes, Terminal, ...) the same visible way. Choosing between the families: anything that lives in a browser - including a web app in an app-shaped window - is my_browser_*; native Mac apps are my_app_*. my_app_* only works on apps the user has allowlisted in the helper's menu bar UI - the agent cannot grant an app; a consent error means asking the user to allow it there. If the my_app_* tools are missing, the helper isn't running (or this isn't a Mac); /lp doctor says which."""
 
 
 _ARGS_ONLY_SCHEMA = {
@@ -169,6 +171,7 @@ def build_collector() -> ToolCollector:
         auth_mod = importlib.import_module(f"{_PKG}.auth")
         bridge_mod = importlib.import_module(f"{_PKG}.bridge")
         chrome_tools = importlib.import_module(f"{_PKG}.chrome_tools")
+        app_tools = importlib.import_module(f"{_PKG}.app_tools")
         commands = importlib.import_module(f"{_PKG}.commands")
     except ImportError as exc:
         # Everything here is stdlib-only since licensing.py stopped verifying
@@ -208,6 +211,10 @@ def build_collector() -> ToolCollector:
     # unlicensed "never" session with no way to even diagnose why.
     if mode != "never":
         chrome_tools.register_all_tools(collector, bridge, auth)
+        # my_app_* shares the knob (see __init__.py's register for why); its
+        # check_fn additionally requires a connected Mac helper, so on any
+        # machine without one these stay invisible with zero platform checks.
+        app_tools.register_all_tools(collector, bridge, auth)
     commands.register_all_commands(collector, bridge, auth)
     atexit.register(bridge.stop)
     # Licence activation now happens in the extension popup, with no

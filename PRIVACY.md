@@ -41,9 +41,17 @@ None of these calls goes to any analytics or telemetry service.
 
 Sensitive domains (e.g. your bank) are configured in the extension popup panel. Flagging a domain blocks the agent from acting on it entirely and turns the overlay border red. The list is stored locally and never transmitted.
 
+## LucidPilot for Mac (native app control)
+
+On macOS, the optional LucidPilot for Mac helper lets an agent control the apps you allow, through the system accessibility API. What it reads (the accessibility tree of the app you targeted, its window titles, the text you asked it to read) and the allowlist of apps you granted all stay on your machine; none of it is sent to us.
+
+The helper asks for two macOS permissions. Accessibility lets it read the target app's controls and send input into it. Screen Recording is requested only for `my_app_screenshot` and session replay; you can deny it and every other tool still works. A window screenshot or a session replay is written to a file on your disk, not uploaded by LucidPilot; if the agent then reads that file, its contents go to whichever model you're running, exactly like a browser screenshot today.
+
+The helper authenticates to the local bridge with a token file (`~/.hermes/lucidpilot/helper-token`, readable only by you) that the bridge writes on your machine. The token never leaves your machine; it only lets the helper receive `app.*` commands over the loopback bridge.
+
 ## Local bridge
 
-The control engine runs a loopback-only HTTP bridge (`127.0.0.1`, not reachable from the network) between the extension and your Hermes/Claude Code session. It only accepts commands from local, non-browser processes and only serves results back to this specific extension's origin. Nothing it handles is sent anywhere beyond your own machine and, when you invoke a control action, the page you're already looking at.
+The control engine runs a loopback-only HTTP bridge (`127.0.0.1`, not reachable from the network) between the extension and your Hermes/Claude Code session. It only accepts commands from local, non-browser processes and only serves results back to this specific extension's origin (or, for the macOS helper, to a local process holding the token file above). Nothing it handles is sent anywhere beyond your own machine and, when you invoke a control action, the app or page you're already looking at.
 
 ## Who is responsible for your data
 

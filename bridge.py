@@ -29,6 +29,12 @@ Endpoints:
                    popup is the consent auth.py's contract requires
   POST /assert-license  extension only (Origin required + pinned) -> the
                    worker's {valid, tier, lastCheckAt} licence report
+  GET  /next?kind=helper  macOS helper only (token required) -> long-poll for
+                   the next app.* command
+  POST /assert-helper-status  macOS helper only (token required) -> the
+                   helper's {helperVersion, tccAccessibility, ...} report
+  GET  /license-token  local processes only (no Origin) -> the raw session
+                   token, so a client-mode sibling can mint a relay ticket
 
 Security (mirrors the TS bridge + SECURITY.md):
   * binds 127.0.0.1 only (loopback): no remote port, no telemetry.
@@ -37,15 +43,24 @@ Security (mirrors the TS bridge + SECURITY.md):
     below), not just any ``chrome-extension://*`` - a plain prefix check would
     let a completely different, unrelated extension installed in the same
     Chrome profile hit these endpoints too, since every extension gets that
-    scheme.
+    scheme. Neither endpoint grants a local process the origin-less pass
+    /status does: /result demands the pinned Origin outright, and /next, which
+    cannot (Chrome strips Origin from a worker GET), demands at minimum a
+    Sec-Fetch-Site header only a browser can set. Both refuse the
+    header-less request _is_local_process_request defines, because a local
+    process that reached /next would be taking a queued command away from the
+    extension and answering it. See ``_is_extension_poll_allowed``.
   * /status is read-only and side-effect-free, but now carries auth/license
     state (see ``ChromeProfileBridge.status`` below) alongside the always-open
     connection counters, so it gets the same origin pinning as /next and
     /result against foreign browser origins - a random webpage's script
     shouldn't get to read whether Chrome control is currently unlocked any
     more than it should get to queue/deliver commands. A local process (no
-    Origin header at all, e.g. curl or ``/lp doctor``) is still allowed,
-    matching /next and /result's own local-process allowance.
+    Origin header at all, e.g. curl or ``/lp doctor``) is still allowed here,
+    and is the one endpoint of the three that still allows it: /status only
+    reads state, so a local process gains nothing it could not already learn
+    by reading ~/.hermes/lucidpilot/auth.json itself, whereas /next and
+    /result hand out and settle queued commands.
   * /testdrive is also read-only, static, and carries no per-user data (same
     fixture HTML for everyone) - the origin gate on it is defense-in-depth
     consistency with the rest of this file's posture, not a real requirement,
@@ -59,13 +74,21 @@ Security (mirrors the TS bridge + SECURITY.md):
     static page from it reuses an already-running server instead of adding a
     new one.
   * /command is accepted only from local non-browser processes.
+  * the macOS helper (a native process, so it has no Origin header at all)
+    authenticates with a shared-secret token file instead: the server-mode
+    bridge writes ~/.hermes/lucidpilot/helper-token (0600) and the helper
+    presents its contents in the x-lucidpilot-helper-token header. This
+    proves "running as this user", not "is the signed helper binary" - the
+    same trust level every local process already has on /command.
 """
 
 from __future__ import annotations
 
 import base64
+import hmac
 import json
 import os
+import secrets
 import sys
 import tempfile
 import threading
@@ -73,7 +96,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse, parse_qs
 from urllib import request as urllib_request, error as urllib_error
 from concurrent.futures import Future
@@ -244,6 +267,99 @@ def extension_version_is_known() -> bool:
 # read per /status or /next call).
 def _current_extension_version() -> str:
     return read_extension_version()
+
+
+# ---------------------------------------------------------------------------
+# macOS helper client. The helper is a second poller of GET /next, kept apart
+# from the Chrome extension by (a) action namespace - app.* is the helper's,
+# everything else is the extension's - and (b) a shared-secret token, since a
+# native process has no Origin header for the pinning above to check.
+# ---------------------------------------------------------------------------
+
+_VERSION_FILE = os.path.join(os.path.dirname(__file__), "VERSION")
+
+
+def _plugin_version() -> str:
+    """The Python plugin's own version (root VERSION file), advertised to the
+    helper via the x-lucidpilot-version header on /next. Same sentinel
+    semantics as UNKNOWN_EXTENSION_VERSION: released plugin zips ship VERSION,
+    so "0.0.0-dev" means "can't know", and callers must not compare it
+    against the helper's real version (see extension_version_is_known)."""
+    try:
+        with open(_VERSION_FILE, encoding="utf-8") as fh:
+            version = fh.read().strip()
+        return version or UNKNOWN_EXTENSION_VERSION
+    except OSError:
+        return UNKNOWN_EXTENSION_VERSION
+
+
+# Same directory (and same import-time env read) as _UPDATE_CHECK_CACHE_PATH
+# above - the test suite's LUCIDPILOT_LICENSE_DIR redirect must cover this
+# file too, or tests would read/write the developer's real helper token.
+_HELPER_TOKEN_PATH = os.path.join(
+    os.environ.get("LUCIDPILOT_LICENSE_DIR", "~/.hermes/lucidpilot"), "helper-token"
+)
+
+
+def helper_token() -> str:
+    """Read the helper's shared secret, creating it on first use.
+
+    NEVER rotates an existing token: the bridge port can hand over between
+    sessions (_try_promote_to_server), and a rotation on every bind would 403
+    a helper that is already running mid-poll. Read fresh on every check (no
+    caching) so a token file rewritten by another process is honored on the
+    next request - the file is the single source of truth. 0600 in a 0700
+    dir, same atomic mkstemp+os.replace shape as _write_update_cache."""
+    path = os.path.expanduser(_HELPER_TOKEN_PATH)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            token = fh.read().strip()
+        if token:
+            return token
+    except OSError:
+        pass
+    token = secrets.token_urlsafe(32)
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".helper-token-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(token)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        # Could not persist (read-only state dir): the in-memory token still
+        # lets this process answer consistently within one run; the helper
+        # simply can't connect, which /lp doctor reports as such.
+        pass
+    return token
+
+
+def _is_helper_request(headers) -> bool:
+    """True when the request presents the current helper token. Constant-time
+    compare; an absent header is an immediate False (the extension and every
+    browser request land here headerless)."""
+    presented = headers.get("x-lucidpilot-helper-token") or ""
+    if not presented:
+        return False
+    try:
+        return hmac.compare_digest(presented, helper_token())
+    except Exception:
+        return False
+
+
+def _command_kind(action: str) -> str:
+    """Which poller may receive this action: "helper" for app.*, "extension"
+    for everything else. Prefix-based on purpose - a new app.<verb> needs no
+    edit here, and an unknown prefix falls to the extension, which is what
+    every pre-helper action already is."""
+    return "helper" if isinstance(action, str) and action.startswith("app.") else "extension"
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +605,17 @@ _LICENSE_ASSERT_TTL_S = 10 * 60
 # production install is ignored, so it can't self-pin a self-signed token.
 # Rotating the prod key means shipping a plugin update - by design (a
 # runtime-fetched key would let anyone re-pin it).
-_LICENSE_PUBKEY_B64_PROD = "J4Kftnhs+ThoqqhjekV/eWo4AY+SDzWmnc1YuPGh/To="
+#
+# ROTATED 2026-08-25: the licensing worker's ENTITLEMENT_SIGNING keypair was
+# rotated to kid bb-2026-08 on 2026-08-24 (fresh pair provisioned for the
+# BitBonsai cloud-auth launch; private half lives only in Cloudflare's secret
+# store). The old pin kept verifying every client's CACHED token until that
+# token's own expiry, so the breakage surfaced machine by machine, days after
+# the rotation, at midnight boundaries - if a licence "goes invalid" with a
+# fresh assertion, check WHICH kid signed the asserted token before touching
+# anything else. Old key, for reading tokens minted before the rotation:
+# J4Kftnhs+ThoqqhjekV/eWo4AY+SDzWmnc1YuPGh/To=
+_LICENSE_PUBKEY_B64_PROD = "Q0VdgQOafLKiq8LpgwIVBklQFn1K8vZ1A42PCeN1wkU="
 
 # Loaded lazily BY FILE PATH (not `import ed25519_verify`) so it works in
 # every way this module gets loaded: as part of the plugin package, and by
@@ -517,6 +643,76 @@ _SERVER_INSTANCE: Optional["ChromeProfileBridge"] = None
 
 class BridgeError(RuntimeError):
     """Command failed, timed out, or the extension reported an error."""
+
+
+class CommandRefused(BridgeError):
+    """A command stopped at one of execute_gated's two gates.
+
+    Carries the HTTP status POST /command answers with, so the wording and the
+    status code stay together instead of the handler re-deriving one from the
+    other. A BridgeError subclass because every caller of bridge.send() and of
+    execute_gated already handles BridgeError, and a refusal is a command that
+    did not run - which is what that type means.
+    """
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+# The revoke killswitch's wording, in one place because two callers now say it:
+# POST /command and remote assist's command loop. A remote helper reads it too,
+# so it names the requester's own popup rather than assuming the reader is
+# sitting in front of the machine.
+_CONTROL_LOCKED_MESSAGE = (
+    "Chrome control is locked (user revoke, idle lock, or "
+    "expired grant). A fresh licence assertion re-grants: if "
+    "this persists, deactivate and re-activate the licence in "
+    "the LucidPilot extension popup, then run /lp doctor."
+)
+
+
+# Set while THIS process is the helper in a remote assist session: every command
+# it sends goes over the relay to the requester's machine instead of to a bridge
+# on this one. Module state rather than a field on ChromeProfileBridge for the
+# same reason AGENT is module state - a process is in one assist session or in
+# none, and there is no per-instance variation to model. remote.py builds the
+# callable (remote.helper_sender); bridge.send is the only reader.
+_REMOTE_SENDER: "Optional[Callable[[str, dict, int], Any]]" = None
+
+
+def set_remote_sender(sender: "Optional[Callable[[str, dict, int], Any]]") -> None:
+    """Route this process's commands over a remote assist session, or stop.
+
+    ``sender(action, params, timeout_ms)`` returns the command's result or
+    raises. Pass None to hand the process back to its local bridge, which is
+    what ending a session does. Only ``send(..., remotable=True)`` consults it,
+    so this process's own overlay and its own /lp doctor keep running here while
+    the agent's tool calls run on the requester's machine.
+    """
+    global _REMOTE_SENDER
+    _REMOTE_SENDER = sender
+
+
+# Set while THIS process is the REQUESTER in a remote assist session: calling it
+# ends that session on this machine. Module state for the same reason as
+# _REMOTE_SENDER above. commands.py installs it when a share goes live and
+# clears it when the share ends; POST /remote-stop is the only other caller, and
+# it exists so the two Stop controls the user can actually see - the one in the
+# in-page indicator and the one in the menu bar - reach the serving loop. Both
+# of those live in another process (Chrome, and the Mac helper app), and the
+# loopback bridge is the only thing all three share.
+_REMOTE_STOP: "Optional[Callable[[], None]]" = None
+
+
+def set_remote_stop(stop: "Optional[Callable[[], None]]") -> None:
+    """Register (or clear) the way to end this machine's live share.
+
+    Idempotent by contract: /remote-stop can be pressed twice, and the in-page
+    control and the menu-bar row can both be pressed for the same session.
+    """
+    global _REMOTE_STOP
+    _REMOTE_STOP = stop
 
 
 @dataclass
@@ -560,6 +756,23 @@ class ChromeProfileBridge:
     _last_seen_at: Optional[float] = None
     _client_name: Optional[str] = None
 
+    # The macOS helper's own liveness slots. Kept SEPARATE from the extension's
+    # _last_seen_at/_client_name above on purpose: `connected` /
+    # `extensionConnected` keep meaning the extension everywhere they are read
+    # today (popup.ts, doctor, redirect gating), and each command family
+    # fail-fasts on its own poller's staleness, not the other's.
+    _helper_seen_at: Optional[float] = None
+    _helper_name: Optional[str] = None
+    # Last POST /assert-helper-status body (validated) + assertedAt. Always
+    # REPLACED whole, never mutated in place - readers take unlocked
+    # snapshots, same convention _poll_age_ms documents for _last_seen_at.
+    _helper_status: Optional[dict] = field(default=None, repr=False)
+
+    # Who this machine is currently shared with in a remote assist session, or
+    # None. Handed to the macOS helper on every GET /next?kind=helper so its
+    # menu bar can say so and offer a Stop row - see set_remote_share.
+    _remote_share: Optional[str] = None
+
     _queue: list = field(default_factory=list, repr=False)
     _pending: dict = field(default_factory=dict, repr=False)
     _cond: threading.Condition = field(default_factory=threading.Condition, repr=False)
@@ -596,6 +809,11 @@ class ChromeProfileBridge:
     # pure-Python verify.
     _license_token_state: str = field(default="missing", repr=False)
     _license_token_claims: Optional[dict] = field(default=None, repr=False)
+    # The raw signed blob itself, kept ONLY while its state is "ok": it is the
+    # credential licensing.relay_ticket() presents to the licensing worker, so
+    # the licence key never has to exist on the Python side. Cleared whenever
+    # verification fails, so a stale or tampered token cannot be re-presented.
+    _license_token_raw: Optional[str] = field(default=None, repr=False)
     _token_memo: Optional[tuple] = field(default=None, repr=False)
 
     # -- lifecycle ---------------------------------------------------------
@@ -608,6 +826,13 @@ class ChromeProfileBridge:
     def connected(self) -> bool:
         # MV3 service workers pause between polls; treat a recent poll as connected.
         return self._last_seen_at is not None and (time.time() - self._last_seen_at) < 5 * 60
+
+    @property
+    def helper_connected(self) -> bool:
+        # Same staleness window as the extension's `connected` - the helper is
+        # a native process that polls more reliably, but one shared constant
+        # beats a second tuning knob until a false "connected" ever bites.
+        return self._helper_seen_at is not None and (time.time() - self._helper_seen_at) < 5 * 60
 
     def ensure_started(self) -> None:
         with self._start_lock:
@@ -647,6 +872,13 @@ class ChromeProfileBridge:
         httpd.bridge = self  # type: ignore[attr-defined]
         self._httpd = httpd
         self._mode = "server"
+        # Make sure the helper's token file exists the moment /next could be
+        # served, so a helper starting right after this bridge finds it.
+        # Best-effort: helper_token() itself degrades to in-memory on OSError.
+        try:
+            helper_token()
+        except Exception:
+            pass
         # In-process fast path for licensing.is_pro_licensed(): the instance
         # that owns the port holds the extension's licence assertion, and a
         # same-process caller should read it directly instead of an HTTP
@@ -701,10 +933,38 @@ class ChromeProfileBridge:
             return self._is_licensed_locked()
 
     def _is_licensed_locked(self) -> bool:
-        """Caller must hold _license_state_lock."""
+        """Caller must hold _license_state_lock.
+
+        There is deliberately NO "has the extension spoken lately" check here
+        any more, and removing it is the fix for a bug that locked working
+        machines several times a day.
+
+        It used to refuse when the last assertion was older than
+        _LICENSE_ASSERT_TTL_S, meaning to catch an extension that had stopped
+        reporting. The problem is that "stopped reporting" and "Chrome
+        suspended the service worker" are the same signal. MV3 workers are
+        suspended aggressively, alarms do not fire while the Mac is asleep,
+        and a laptop that slept for eleven minutes woke up to a revoked
+        grant and a message telling its owner to go and re-activate a licence
+        that had never stopped being valid. The only reliable way out was
+        another command that happened to wake the worker, which is why this
+        looked like "/lp doctor fixes it".
+
+        What actually proves the licence is the server-signed session token:
+        Ed25519, machine-bound, with its own expiresAt, checked below by
+        _license_token_read_state(). That is the authority and it is the one
+        the licensing design intends ("period-end-bound"). A wall clock over
+        the top of it added no security that the token does not already
+        provide, and subtracted a working browser every time a machine slept.
+
+        What this costs, stated plainly: an extension that is uninstalled or
+        disabled leaves this machine licensed until the token itself expires,
+        rather than for ten more minutes. That window is the offline grace the
+        token was issued with on purpose, and app.* control is the only thing
+        that could still run in it, since page.* needs the very extension that
+        just went away.
+        """
         if self._license_asserted_at is None or not self._license_assertion:
-            return False
-        if (time.time() - self._license_asserted_at) > _LICENSE_ASSERT_TTL_S:
             return False
         if self._license_assertion.get("valid") is not True:
             return False
@@ -800,6 +1060,10 @@ class ChromeProfileBridge:
                 if not isinstance(asserted_machine, str) or asserted_machine != token_machine:
                     token_state, token_claims = "invalid", None
             self._license_token_state, self._license_token_claims = token_state, token_claims
+            # Raw retention follows the FINAL verdict - after the machine
+            # binding check above, not before it - so a token minted for
+            # another machine is never handed onward as a credential.
+            self._license_token_raw = parsed.get("token") if token_state == "ok" else None
             self._license_asserted_at = time.time()
         # 1.2.0: licence activation IS the consent moment for browser control.
         # No more /lp authorize - the moment the extension asserts a valid
@@ -840,6 +1104,54 @@ class ChromeProfileBridge:
                 # a stale or tampered extension, the update-extension message).
                 "licenseAssertedValid": (self._license_assertion or {}).get("valid") is True,
             }
+
+    def license_token(self) -> Optional[str]:
+        """The raw server-signed session token, or None when there is nothing
+        a licensing endpoint should be shown. Expiry is folded in via
+        _license_token_read_state, so a token that verified at ingest but has
+        since lapsed comes back None rather than being presented and refused."""
+        with self._license_state_lock:
+            if self._license_token_read_state() != "ok":
+                return None
+            return self._license_token_raw
+
+    # -- helper status (macOS helper -> Python) ----------------------------
+
+    def note_helper_status(self, raw: str) -> None:
+        """Store the body of a token-gated POST /assert-helper-status.
+        Parsed input from a trust boundary: unknown keys dropped, types
+        coerced, grantedApps capped. Malformed input is ignored - a broken
+        report must never take the channel down."""
+        try:
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                raise ValueError("helper status is not an object")
+        except (ValueError, TypeError):
+            return
+        granted = parsed.get("grantedApps")
+        if isinstance(granted, list):
+            granted = [g for g in granted if isinstance(g, str)][:200]
+        else:
+            granted = []
+        version = parsed.get("helperVersion")
+        self._helper_status = {
+            "helperVersion": version if isinstance(version, str) else None,
+            "tccAccessibility": parsed.get("tccAccessibility") is True,
+            "tccScreenRecording": parsed.get("tccScreenRecording") is True,
+            "secureInputActive": parsed.get("secureInputActive") is True,
+            "grantedApps": granted,
+            "assertedAt": time.time(),
+        }
+
+    def helper_fields(self) -> dict:
+        """The helper part of GET /status. Pure in-memory read - this is on
+        the check_fn path (evaluated once per tool per tools/list), so it
+        must never touch disk or the network, exactly like license_fields."""
+        return {
+            "helperConnected": self.helper_connected,
+            "helperLastSeenAt": self._helper_seen_at,
+            "helper": self._helper_status,
+        }
 
     # -- legacy key migration ---------------------------------------------
 
@@ -927,6 +1239,11 @@ class ChromeProfileBridge:
             # can render a real countdown instead of parsing authSummary.
             "authorizedUntil": self.auth.authorized_until() if self.auth else None,
             **self.license_fields(),
+            **self.helper_fields(),
+            # What the helper should be running; same sentinel caveat as
+            # `version`/`versionKnown` above, but for the Python plugin's own
+            # VERSION file rather than the bundled extension manifest.
+            "expectedHelperVersion": _plugin_version(),
         }
 
     # -- send (Hermes -> Chrome) ------------------------------------------
@@ -936,30 +1253,198 @@ class ChromeProfileBridge:
         action: str,
         params: Optional[dict] = None,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
+        *,
+        remotable: bool = False,
     ) -> Any:
+        """The one place that decides where a command goes.
+
+        Three destinations, longest wire last: a bridge in this process, a
+        sibling session that owns the port, or - while this process is the
+        helper in a remote assist session - the requester's machine on the far
+        side of the relay. The remote branch is the same idea _send_via_owner
+        has always implemented ("my agent's commands execute on someone else's
+        bridge"), with a longer wire and a mailbox its owner cannot open, which
+        is why it belongs here rather than in a second send path that would
+        drift out of step with this one.
+
+        ``remotable`` says this command came from an agent tool call, which is
+        the only kind an assist session is about. It is opt-in, and it defaults
+        to False on purpose: the other callers of send() are this process's own
+        internals - indicator_tools painting the helper's own overlay,
+        commands.py's /lp doctor probing the helper's own Chrome and helper -
+        and shipping those to the requester would cost the helper their own
+        indicator and their own diagnostics, refused at the far end as a scope
+        violation with no hint that a local tool was simply misrouted. Forgetting
+        the flag on a new call site therefore keeps the behaviour send() has
+        always had rather than quietly widening what crosses the relay.
+        """
+        sender = _REMOTE_SENDER if remotable else None
+        if sender is not None:
+            try:
+                return sender(action, params or {}, timeout_ms)
+            except BridgeError:
+                raise
+            except Exception as exc:
+                # Everything upstream of send() (chrome_tools._guard,
+                # app_tools) handles BridgeError and nothing else, so a failure
+                # out on the relay has to arrive as one rather than escaping as
+                # remote.py's RemoteError into a tool call nobody is catching.
+                raise BridgeError(f"Remote assist: {exc}") from None
         self.ensure_started()
         if self._mode == "client":
             return self._send_via_owner(action, params or {}, timeout_ms)
         return self._send_local(action, params or {}, timeout_ms)
 
+    def execute_gated(
+        self,
+        action: str,
+        params: dict,
+        timeout_ms: int = DEFAULT_TIMEOUT_MS,
+        *,
+        remote: bool = False,
+    ) -> Any:
+        """Run one command through the two gates every command must pass.
+
+        THE chokepoint, and it has to stay a single one. Two callers arrive
+        here: POST /command (any local process, and any client-mode session)
+        and remote.py's command loop (a helper on the far side of the relay).
+        Gating them in two places would mean two licence checks and two revoke
+        checks that agree today and drift on the Tuesday somebody edits one of
+        them, which for the revoke killswitch means a helper who keeps driving
+        the browser after the requester locked it.
+
+        Raises CommandRefused when a gate says no, BridgeError when the command
+        itself fails. It dispatches at the bottom of this method rather than
+        through self.send(): send() is the outbound path, and a command that
+        arrived here came IN, so a process that was both helper and requester
+        would otherwise post an inbound command straight back out over the
+        relay.
+
+        ``remote=True`` differs from a local call in exactly one way, and it is
+        the overlay.fire exemption below.
+        """
+        # Remote assist is free on the requester's side, and this is where that
+        # is decided. The reasoning, because it is a licensing decision sitting
+        # in a security gate:
+        #
+        # The paid thing is driving somebody else's machine, and that lives on
+        # the HELPER's side - their agent's my_browser_* calls go through
+        # chrome_tools._send, which requires their licence before anything
+        # leaves. Charging the requester too was charging a stranger admission to
+        # be helped: they install this because someone they trust told them to,
+        # and the first thing they met was a paywall for a product they had not
+        # chosen.
+        #
+        # What makes it safe to skip is the precondition, not generosity.
+        # `remote` is a Python argument, never a wire field: POST /command
+        # cannot set it (it does not pass the kwarg at all), so the only caller
+        # that can is remote.py's loop. And `_remote_share` is set by
+        # _share_confirm AFTER hmac.compare_digest on the six digits, so both
+        # together mean "a pairing this machine's own user verified out loud is
+        # live right now". That is a stronger consent signal than a licence key.
+        verified_share = remote and self._remote_share is not None
+        if not verified_share:
+            license_error = _require_command_licensed(self, action)
+            if license_error is not None:
+                raise CommandRefused(license_error, 402)
+        # Revoke killswitch, server-side. chrome_tools._send gates on auth in
+        # the CLIENT process, but this is also reachable by client-mode
+        # sessions and bare local callers that never ran that gate. Honoring
+        # auth here means /lp revoke in any session stops every session's
+        # commands at the one chokepoint they all share, and it does that
+        # cross-process with no new code: auth.py's (mtime_ns, inode, size)
+        # stamp is re-read on every is_authorized(). Only enforced when auth is
+        # wired (it always is in real sessions); a bare test bridge without
+        # auth keeps its licence-only behavior.
+        #
+        # overlay.fire is exempt for LOCAL callers on purpose: indicator_tools'
+        # gate is licence-only because painting an overlay is not driving the
+        # browser (see its module docstring) - a client-mode session's
+        # indicator must keep working while Chrome control is locked, same as
+        # in server mode. A REMOTE caller gets no such exemption. The overlay
+        # is the requester's own screen, and someone who just revoked control
+        # must not still be painted on by the helper they revoked.
+        auth = self.auth
+        exempt = action == "overlay.fire" and not remote
+        if verified_share:
+            # A free requester has no grant to be authorised BY - is_authorized()
+            # is False for ever on an unlicensed machine - so asking that question
+            # here would refuse every command in a session the user just approved
+            # out loud. What still has to be honoured is the killswitch, and that
+            # is a DIFFERENT fact: "I pressed revoke" rather than "I never bought
+            # this". Only the first stops a helper mid-session.
+            if auth is not None and auth.user_revoked():
+                raise CommandRefused(_CONTROL_LOCKED_MESSAGE, 403)
+        elif not exempt and auth is not None and not auth.is_authorized():
+            raise CommandRefused(_CONTROL_LOCKED_MESSAGE, 403)
+        # Dispatch, deliberately without send()'s lazy ensure_started(), which
+        # would REBIND a bridge that was stopped. POST /command cannot reach
+        # that case (its handler only exists while a server is up) but
+        # remote.py's loop can, and a command still in flight when the requester
+        # ends their session and stops the bridge must not re-open a listening
+        # socket on 127.0.0.1 behind their back.
+        if self._mode == "client":
+            return self._send_via_owner(action, params, timeout_ms)
+        if self._httpd is None:
+            raise BridgeError("the LucidPilot bridge is not running")
+        return self._send_local(action, params, timeout_ms)
+
+    # -- remote assist ------------------------------------------------------
+
+    def set_remote_share(self, label: "Optional[str]") -> None:
+        """Name whoever this machine is shared with right now, or None.
+
+        This is the one fact about a share the macOS helper cannot work out for
+        itself. It only ever sees app.* commands, so a menu-bar row derived from
+        dispatched commands is (a) missing entirely for a browser-scope share,
+        which never sends it one, and (b) gone again as soon as the control
+        session's idle timeout fires, which is a few seconds of quiet rather
+        than the end of anything. The share's real lifetime is known here and
+        only here, so the helper reads it off GET /next?kind=helper.
+
+        A waiting poller is woken so the row appears when the share starts,
+        rather than up to _NEXT_LONG_POLL_S later - which for a person opening
+        that menu because a stranger is clicking around their Mac is the whole
+        difference between a control and a decoration.
+
+        ponytail: this is the bridge SERVER's state, so it is right for the
+        session that owns the port and invisible from a session proxying through
+        _send_via_owner. Same ceiling as _REMOTE_STOP, and the same upgrade:
+        forward both over /command rather than keeping them beside it.
+        """
+        with self._cond:
+            if self._remote_share == label:
+                return
+            self._remote_share = label
+            self._cond.notify_all()
+
+    def remote_share(self) -> "Optional[str]":
+        return self._remote_share
+
     def _send_local(self, action: str, params: dict, timeout_ms: int) -> Any:
-        # Dead extension, dead air: with Chrome closed a click used to sit here
-        # for its whole 200s timeout only to end with the very message we can
-        # already give. If the extension has been silent past _POLL_STALE_MS,
-        # say so now and don't even queue the command.
-        poll_age = self._poll_age_ms()
+        # Dead poller, dead air: with the responsible client gone a click used
+        # to sit here for its whole 200s timeout only to end with the very
+        # message we can already give. Staleness is judged PER KIND - an
+        # app.* command cares whether the macOS helper polls, not whether the
+        # extension does, and vice versa.
+        kind = _command_kind(action)
+        poll_age = self._poll_age_ms(kind)
         if poll_age is not None and poll_age > _POLL_STALE_MS:
-            raise BridgeError(self._not_polling_message("Not sent"))
+            raise BridgeError(self._not_polling_message("Not sent", kind))
         command = BridgeCommand(id=uuid.uuid4().hex, action=action, params=params)
         future: Future = Future()
         with self._cond:
             self._pending[command.id] = _Pending(command=command, future=future)
             self._queue.append(command)
-            self._cond.notify()
+            # notify_all, not notify: with two pollers parked in
+            # _take_next_command a single notify can wake the WRONG one (it
+            # rescans, finds nothing of its kind, sleeps again) while the
+            # right one sleeps out its full long-poll window.
+            self._cond.notify_all()
         timeout_s = timeout_ms / 1000
         if poll_age is None:
             # Never polled: the bridge may have started a second ago with the
-            # extension's first poll already in flight, so a short grace here
+            # client's first poll already in flight, so a short grace here
             # instead of the full timeout. The command is queued FIRST, and the
             # grace is spent waiting on the future rather than sleeping, so a
             # first poll landing at 0.2s picks it up at 0.2s and a fast result
@@ -968,14 +1453,14 @@ class ChromeProfileBridge:
             try:
                 return future.result(timeout=grace)
             except FuturesTimeout:
-                if self._last_seen_at is None:
+                if self._poll_age_ms(kind) is None:
                     self._drop_pending(command.id)
-                    raise BridgeError(self._not_polling_message("Not sent")) from None
+                    raise BridgeError(self._not_polling_message("Not sent", kind)) from None
             timeout_s -= grace
         try:
             return future.result(timeout=timeout_s)
         except FuturesTimeout:
-            raise BridgeError(self._timeout_message(self._drop_pending(command.id), timeout_ms))
+            raise BridgeError(self._timeout_message(self._drop_pending(command.id), timeout_ms, kind))
 
     def _drop_pending(self, command_id: str) -> Optional[_Pending]:
         """Un-queue a command that will never be answered; returns its entry
@@ -985,42 +1470,54 @@ class ChromeProfileBridge:
             self._queue = [c for c in self._queue if c.id != command_id]
         return entry
 
-    def _poll_age_ms(self) -> Optional[float]:
-        """Age of the extension's last poll in ms, None if it never polled.
-        _last_seen_at is written unlocked on request threads (_mark_seen) and
-        read unlocked everywhere else (`connected`, status()); a plain
+    def _poll_age_ms(self, kind: str = "extension") -> Optional[float]:
+        """Age of the given poller's last poll in ms, None if it never polled.
+        The seen-at slots are written unlocked on request threads (_mark_seen)
+        and read unlocked everywhere else (`connected`, status()); a plain
         attribute read is atomic and no caller needs more than a snapshot, so
-        this reads it the same way."""
-        last = self._last_seen_at
+        this reads them the same way."""
+        last = self._helper_seen_at if kind == "helper" else self._last_seen_at
         return None if last is None else (time.time() - last) * 1000
 
-    def _not_polling_message(self, lead: str) -> str:
-        """The one place the extension-is-gone wording lives: both the
-        fail-fast in _send_local and _timeout_message's not-polling branch say
-        this, differing only in how the failure is introduced."""
-        poll_age = self._poll_age_ms()
+    def _not_polling_message(self, lead: str, kind: str = "extension") -> str:
+        """The one place the poller-is-gone wording lives: both the fail-fast
+        in _send_local and _timeout_message's not-polling branch say this,
+        differing only in how the failure is introduced. The helper branch
+        must name the HELPER as the fix - telling a user whose extension is
+        fine to reinstall the extension reads as nonsense."""
+        poll_age = self._poll_age_ms(kind)
         seen = "never" if poll_age is None else f"{round(poll_age / 1000)}s ago"
+        if kind == "helper":
+            return (
+                f"{lead}: LucidPilot for Mac is not running (last seen {seen}). Ask the user to "
+                "install and launch the LucidPilot for Mac helper app, then run /lp doctor."
+            )
         return (
             f"{lead}: the Chrome extension is not polling (last seen {seen}). Ask the user to "
             "run /lp onboard to install the companion extension and to keep that browser "
             "window open."
         )
 
-    def _timeout_message(self, entry: Optional[_Pending], timeout_ms: int) -> str:
+    def _timeout_message(self, entry: Optional[_Pending], timeout_ms: int, kind: str = "extension") -> str:
+        client = "LucidPilot for Mac" if kind == "helper" else "the Chrome extension"
+        remedy = (
+            "quit and relaunch the LucidPilot for Mac helper app"
+            if kind == "helper"
+            else "reload the LucidPilot Chrome extension at chrome://extensions"
+        )
         if entry is not None and entry.delivered_at:
             return (
-                f"Timed out after {timeout_ms}ms: the Chrome extension received the command but "
+                f"Timed out after {timeout_ms}ms: {client} received the command but "
                 "never returned a result. The action may be long-running, or the result post "
-                "failed. Ask the user to run /lp doctor; if it persists, they should reload the "
-                "LucidPilot Chrome extension at chrome://extensions."
+                f"failed. Ask the user to run /lp doctor; if it persists, they should {remedy}."
             )
-        poll_age = self._poll_age_ms()
+        poll_age = self._poll_age_ms(kind)
         if poll_age is None or poll_age > _POLL_STALE_MS:
-            return self._not_polling_message(f"Timed out after {timeout_ms}ms")
+            return self._not_polling_message(f"Timed out after {timeout_ms}ms", kind)
         return (
-            f"Timed out after {timeout_ms}ms: the Chrome extension is polling (last seen "
+            f"Timed out after {timeout_ms}ms: {client} is polling (last seen "
             f"{round(poll_age / 1000)}s ago) but did not pick up this command in time. Retry; if "
-            "it persists, reload the LucidPilot Chrome extension at chrome://extensions."
+            f"it persists, {remedy}."
         )
 
     def _send_via_owner(self, action: str, params: dict, timeout_ms: int) -> Any:
@@ -1062,24 +1559,46 @@ class ChromeProfileBridge:
 
     # -- queue internals (called by the request handler) -------------------
 
-    def _take_next_command(self) -> Optional[BridgeCommand]:
-        """Long-poll: return the next queued command or None after the poll window."""
+    def _take_next_command(self, kind: str = "extension") -> Optional[BridgeCommand]:
+        """Long-poll: return the next queued command OF THIS POLLER'S KIND, or
+        None after the poll window. One shared queue with a kind-aware scan
+        rather than a queue per kind: the queue is 0-2 deep in practice, and a
+        second list would double the state stop()/_drop_pending/status() keep
+        in step. ponytail: linear rescan per wake; partition into per-kind
+        deques if a batching client ever makes the queue deep."""
         deadline = time.monotonic() + _NEXT_LONG_POLL_S
         with self._cond:
-            while not self._queue:
+            share = self._remote_share
+            while True:
+                for i, command in enumerate(self._queue):
+                    if _command_kind(command.action) == kind:
+                        del self._queue[i]
+                        entry = self._pending.get(command.id)
+                        if entry is not None:
+                            entry.delivered_at = time.time()
+                        return command
+                # A share starting or ending is the one non-command event the
+                # helper's poll carries (see set_remote_share), and its menu bar
+                # is a live control rather than a status line, so it ends the
+                # poll window early instead of waiting it out.
+                if kind == "helper" and self._remote_share != share:
+                    return None
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
                 self._cond.wait(remaining)
-            command = self._queue.pop(0)
-            entry = self._pending.get(command.id)
-            if entry is not None:
-                entry.delivered_at = time.time()
-            return command
 
-    def _deliver_result(self, result: dict) -> bool:
+    def _deliver_result(self, result: dict, kind: str = "extension") -> bool:
         with self._cond:
-            pending = self._pending.pop(result.get("id"), None)
+            command_id = result.get("id")
+            pending = self._pending.get(command_id)
+            # A poller of one kind must not complete the other kind's command:
+            # the sender's kind is proven (token vs pinned Origin), the
+            # pending command's kind is derived from its action, and a
+            # mismatch is answered like an unknown id.
+            if pending is not None and _command_kind(pending.command.action) != kind:
+                return False
+            pending = self._pending.pop(command_id, None)
         if pending is None:
             return False
         if pending.future.done():
@@ -1092,7 +1611,12 @@ class ChromeProfileBridge:
             )
         return True
 
-    def _mark_seen(self, client_name: Optional[str] = None) -> None:
+    def _mark_seen(self, client_name: Optional[str] = None, kind: str = "extension") -> None:
+        if kind == "helper":
+            self._helper_seen_at = time.time()
+            if client_name is not None:
+                self._helper_name = client_name
+            return
         self._last_seen_at = time.time()
         if client_name is not None:
             self._client_name = client_name
@@ -1150,6 +1674,48 @@ def _is_local_process_request(headers) -> bool:
     return not headers.get("origin") and not headers.get("sec-fetch-site")
 
 
+def _is_extension_poll_allowed(headers) -> bool:
+    """GET /next's extension path: pinned Origin when present, and browser-issued.
+
+    _is_browser_origin_allowed alone says yes to a request carrying NEITHER an
+    Origin NOR a Sec-Fetch-Site, which is precisely what
+    _is_local_process_request calls a local process. That let any process on
+    the machine long-poll /next, take a queued command off the queue and answer
+    it, which is theft of an in-flight command, not merely a read.
+
+    The extension cannot be asked for an Origin here and that is not a choice:
+    Chrome omits Origin on a GET from an extension worker to a host-permitted
+    URL (sniffed on the real built extension, same finding that killed the
+    piggyback-header licence assertion - see _handle_assert_license). The same
+    sniff shows it DOES send ``Sec-Fetch-Site: none``, and Sec-Fetch-* are
+    forbidden header names, so a page's JS can never set them and only the
+    browser itself does. Requiring one of the two present is therefore the
+    strongest gate this endpoint can hold without an extension change.
+
+    Its honest limit, the same one /authorize documents: a local NON-browser
+    process can forge Sec-Fetch-Site with curl. This proves "not a local
+    process that merely asked", not "the real extension". Closing it properly
+    needs a secret the extension holds, and the extension has no way to obtain
+    one over loopback that a same-uid process could not obtain too. Do not
+    build anything on this gate that assumes otherwise: a same-uid process on
+    this machine can already read auth.json and helper-token (both 0600, both
+    owned by that same uid) and attach to Chrome over CDP by itself, so it is
+    outside the threat model here exactly as it is on /command.
+
+    # ponytail: the no-Origin branch also accepts Sec-Fetch-Site: same-origin,
+    # which is what a script on a page THIS server serves would send - today
+    # only /testdrive, static fixture HTML with no user input and so no way to
+    # get hostile script onto it. Narrowing to exactly "none" would close that
+    # and costs one comparison, but it stakes the whole poll loop on a single
+    # sniff of what Chrome sends, and a wrong guess 403s every poll and kills
+    # the product. Narrow it when there is a second HTML surface on this
+    # origin, or once a CI job asserts the real extension's header shape.
+    """
+    if not _is_browser_origin_allowed(headers):
+        return False
+    return bool(headers.get("origin") or headers.get("sec-fetch-site"))
+
+
 def _require_command_licensed(bridge: "ChromeProfileBridge", action: str) -> Optional[str]:
     """None if ``action`` may proceed over POST /command, else the error
     message to send back instead.
@@ -1183,13 +1749,12 @@ def _require_command_licensed(bridge: "ChromeProfileBridge", action: str) -> Opt
         return None
     fields = bridge.license_fields()
     asserted_at = fields["licenseAssertedAt"]
-    stale = asserted_at is None or (time.time() - asserted_at) > _LICENSE_ASSERT_TTL_S
-    if stale:
-        return (
-            "LucidPilot requires an active license, and the Chrome extension has "
-            "not reported a licence recently. Check that the LucidPilot extension "
-            "is installed and running (chrome://extensions), then run /lp doctor."
-        )
+    # The TOKEN's verdict is asked first, because the token is what decides
+    # (see _is_licensed_locked). Staleness only picks the wording now, and it
+    # must not get first refusal: a machine whose licence genuinely expired
+    # while it was asleep is stale AND expired, and telling that person their
+    # extension "has not reported recently" sends them to reinstall a working
+    # extension instead of renewing. Name the real cause.
     if fields["licenseAssertedValid"] and fields["licenseTokenState"] in ("missing", "invalid", "expired"):
         # Reporting a licence it cannot prove: an extension too old to send a
         # session token, one whose token expired offline, or a tampered one.
@@ -1201,6 +1766,25 @@ def _require_command_licensed(bridge: "ChromeProfileBridge", action: str) -> Opt
             "release, then open chrome://extensions and click the refresh icon "
             "on it. If it is already current, reconnect to the internet so the "
             "licence can re-verify, then retry."
+        )
+    stale = asserted_at is None or (time.time() - asserted_at) > _LICENSE_ASSERT_TTL_S
+    if stale:
+        if action.startswith("app."):
+            # A helper-only user may have never installed the extension - but
+            # the extension IS the licence-activation channel (the only place
+            # a key is entered), even for Mac app control. Name that, or this
+            # error reads as nonsense to someone who never wanted a browser
+            # extension.
+            return (
+                "LucidPilot requires an active license, and none has been asserted "
+                "recently. The Chrome extension is what activates and reports your "
+                "licence, even for Mac app control: install it, activate your key "
+                "in its popup, then run /lp doctor."
+            )
+        return (
+            "LucidPilot requires an active license, and the Chrome extension has "
+            "not reported a licence recently. Check that the LucidPilot extension "
+            "is installed and running (chrome://extensions), then run /lp doctor."
         )
     try:
         from .licensing import PURCHASE_URL as purchase_url
@@ -1280,6 +1864,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/next":
             self._handle_next()
             return
+        if path == "/license-token":
+            self._handle_license_token()
+            return
         self._send_json(404, {"error": "not found"}, _cors_headers_for(self.headers))
 
     def do_POST(self) -> None:  # noqa: N802
@@ -1298,6 +1885,12 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/assert-license":
             self._handle_assert_license()
             return
+        if path == "/assert-helper-status":
+            self._handle_assert_helper_status()
+            return
+        if path == "/remote-stop":
+            self._handle_remote_stop()
+            return
         self._send_json(404, {"error": "not found"}, _cors_headers_for(self.headers))
 
     # -- endpoints ---------------------------------------------------------
@@ -1314,6 +1907,21 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(403, {"ok": False, "error": "browser origin not allowed"}, cors)
             return
         self._send_json(200, self._bridge.status(), cors)
+
+    def _handle_license_token(self) -> None:
+        """The raw session token, for a CLIENT-mode sibling session about to
+        mint a relay ticket (licensing.relay_ticket). Local processes only -
+        the same gate as /command, and the same honest ceiling: a same-uid
+        process this refuses could POST /command and drive the browser
+        outright, so this hides the token from web pages, not from malware."""
+        if not _is_local_process_request(self.headers):
+            self._send_json(403, {"ok": False, "error": "the licence token is served only to local processes"})
+            return
+        token = self._bridge.license_token()
+        if not token:
+            self._send_json(404, {"ok": False, "error": "no verified licence token held"})
+            return
+        self._send_json(200, {"ok": True, "token": token})
 
     def _handle_testdrive(self) -> None:
         cors = _cors_headers_for(self.headers)
@@ -1341,43 +1949,50 @@ class _Handler(BaseHTTPRequestHandler):
         if not action:
             self._send_json(400, {"ok": False, "error": "Missing command action"})
             return
-        license_error = _require_command_licensed(self._bridge, action)
-        if license_error is not None:
-            self._send_json(402, {"ok": False, "error": license_error})
-            return
-        # Revoke killswitch, server-side. chrome_tools._send gates on auth in
-        # the CLIENT process, but /command is also reachable by client-mode
-        # sessions and bare local callers that never ran that gate. Honoring
-        # auth here means /lp revoke in any session stops every session's
-        # commands at the one chokepoint they all share. Only enforced when
-        # auth is wired (it always is in real sessions); a bare test bridge
-        # without auth keeps its licence-only behavior. overlay.fire is
-        # exempt on purpose: indicator_tools' gate is licence-only because
-        # painting an overlay is not driving the browser (see its module
-        # docstring) - a client-mode session's indicator must keep working
-        # while Chrome control is locked, same as in server mode.
-        auth = self._bridge.auth
-        if action != "overlay.fire" and auth is not None and not auth.is_authorized():
-            self._send_json(403, {"ok": False, "error": (
-                "Chrome control is locked (user revoke, idle lock, or "
-                "expired grant). A fresh licence assertion re-grants: if "
-                "this persists, deactivate and re-activate the licence in "
-                "the LucidPilot extension popup, then run /lp doctor."
-            )})
-            return
+        # Both gates live in execute_gated, which remote assist's command loop
+        # also calls, so a helper's command is refused by the same licence
+        # check and the same revoke killswitch a local one is. CommandRefused
+        # first: it is a BridgeError subclass, and a gate refusal is a 402 or a
+        # 403, never the 504 a real command failure gets.
         try:
-            result = self._bridge._send_local(
+            result = self._bridge.execute_gated(
                 action, body.get("params") or {}, body.get("timeoutMs") or DEFAULT_TIMEOUT_MS
             )
             self._send_json(200, {"ok": True, "result": result})
+        except CommandRefused as exc:
+            self._send_json(exc.status, {"ok": False, "error": str(exc)})
         except BridgeError as exc:
             self._send_json(504, {"ok": False, "error": str(exc)})
 
     def _handle_next(self) -> None:
-        if not _is_browser_origin_allowed(self.headers):
+        qs = parse_qs(urlparse(self.path).query)
+        if (qs.get("kind") or [""])[0] == "helper":
+            # The macOS helper's poll. Token-gated (a native process has no
+            # Origin for the pin below to check); no CORS headers - this is
+            # never a browser. The extension's own path stays byte-identical
+            # below: its poll loop treats any non-200 as fatal-with-backoff.
+            if not _is_helper_request(self.headers):
+                self._send_json(403, {"ok": False, "error": "helper token missing or wrong"})
+                return
+            self._bridge._mark_seen((qs.get("name") or [None])[0], kind="helper")
+            command = self._bridge._take_next_command("helper")
+            headers = {"x-lucidpilot-version": _plugin_version()}
+            if command is not None:
+                payload = {
+                    "type": "command",
+                    "command": {"id": command.id, "action": command.action, "params": command.params},
+                }
+            else:
+                payload = {"type": "none"}
+            # On BOTH shapes, and on every poll rather than only when it
+            # changes: this poll is the helper's whole picture of the share, and
+            # a field it can miss is a menu-bar row that can be wrong.
+            payload["remote"] = self._bridge.remote_share()
+            self._send_json(200, payload, headers)
+            return
+        if not _is_extension_poll_allowed(self.headers):
             self._send_json(403, {"ok": False, "error": "browser origin not allowed"}, _cors_headers_for(self.headers))
             return
-        qs = parse_qs(urlparse(self.path).query)
         self._bridge._mark_seen((qs.get("name") or [None])[0])
         command = self._bridge._take_next_command()
         version = _current_extension_version()
@@ -1408,6 +2023,44 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._bridge.note_license_assertion(self._read_body())
         self._send_json(200, {"ok": True}, _cors_headers_for(self.headers))
+
+    def _handle_remote_stop(self) -> None:
+        # The Stop control in the in-page indicator and the one in the menu bar
+        # both land here, and they are the only two callers this accepts.
+        #
+        # An earlier cut of this gated on nothing, reasoning that an endpoint
+        # which only ever REMOVES capability cannot be misused. That was wrong
+        # about who can call it. A POST from a page carrying a plain
+        # content-type is a CORS-simple request: no preflight is sent, the
+        # browser delivers it, and an ungated handler runs - so any page the
+        # requester visits, including one the helper walked them onto, could end
+        # the share silently and do it again on every load so a share never got
+        # going. Denial only, but denial of the feature by anyone on the web.
+        #
+        # So: the pinned extension Origin (glue.js's remoteStop is a POST and
+        # POSTs always carry one), or a header-less local request, which is the
+        # Mac helper's URLSession. A page can never be either - it cannot remove
+        # its own Origin. Same honest limit every other gate here documents: a
+        # same-uid process can forge the header-less shape with curl, and for an
+        # endpoint whose whole effect is "stop sharing" that is not worth
+        # another lock.
+        #
+        # `stopped` is what it did, not what it was told: false means no share
+        # was live here. The extension reads that field rather than the status
+        # code, because "this bridge is too old to know what /remote-stop means"
+        # (404) and "there was nothing to stop" are opposite answers to the
+        # question of whether the Stop button worked.
+        cors = _cors_headers_for(self.headers)
+        origin = self.headers.get("origin") or ""
+        if origin not in _ALLOWED_EXTENSION_ORIGINS and not _is_local_process_request(self.headers):
+            self._send_json(403, {"ok": False, "error": "stop requests are accepted only from LucidPilot itself"}, cors)
+            return
+        stop = _REMOTE_STOP
+        if stop is None:
+            self._send_json(200, {"ok": True, "stopped": False}, cors)
+            return
+        stop()
+        self._send_json(200, {"ok": True, "stopped": True}, cors)
 
     def _handle_authorize(self) -> None:
         # Extension-only, stricter than _is_browser_origin_allowed on its own:
@@ -1454,8 +2107,32 @@ class _Handler(BaseHTTPRequestHandler):
         }, cors)
 
     def _handle_result(self) -> None:
+        # The helper token, when present and correct, identifies the sender's
+        # kind; _deliver_result then refuses to complete the other kind's
+        # commands. The extension never sends this header, so its path below
+        # is untouched.
+        if _is_helper_request(self.headers):
+            self._bridge._mark_seen(kind="helper")
+            try:
+                result = json.loads(self._read_body() or "{}")
+            except json.JSONDecodeError:
+                self._send_json(400, {"ok": False, "error": "Invalid JSON"})
+                return
+            if not self._bridge._deliver_result(result, kind="helper"):
+                self._send_json(404, {"ok": False, "error": "unknown command id"})
+                return
+            self._send_json(200, {"ok": True})
+            return
+        # Extension-only, and stricter than /next's gate above: the Origin must
+        # be PRESENT and pinned, the same bar /authorize and /assert-license
+        # hold. /next has to settle for Sec-Fetch-Site because Chrome strips
+        # Origin from a worker GET; this is a POST, and Chrome appends Origin
+        # to every non-GET request, so the full pin is affordable here
+        # (sniffed on the real built extension, both requests, same session).
+        # Without it an origin-less local process could answer a command it
+        # never received, or race the real extension to answer one it did.
         cors = _cors_headers_for(self.headers)
-        if not _is_browser_origin_allowed(self.headers):
+        if (self.headers.get("origin") or "") not in _ALLOWED_EXTENSION_ORIGINS:
             self._send_json(403, {"ok": False, "error": "browser origin not allowed"}, cors)
             return
         self._bridge._mark_seen()
@@ -1469,3 +2146,14 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"ok": False, "error": "unknown command id"}, cors)
             return
         self._send_json(200, {"ok": True}, cors)
+
+    def _handle_assert_helper_status(self) -> None:
+        # The macOS helper's state report (version, TCC grants, allowlist).
+        # Token-gated, mirroring /assert-license's extension pinning: the
+        # bridge holds the verdicts, the pollers assert them.
+        if not _is_helper_request(self.headers):
+            self._send_json(403, {"ok": False, "error": "helper status is accepted only from the LucidPilot Mac helper"})
+            return
+        self._bridge._mark_seen(kind="helper")
+        self._bridge.note_helper_status(self._read_body())
+        self._send_json(200, {"ok": True, "expectedHelperVersion": _plugin_version()})

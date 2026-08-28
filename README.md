@@ -18,13 +18,15 @@
 <p align="center">
   <img alt="Licence" src="https://img.shields.io/badge/code-MIT-green">
   <img alt="Chrome Web Store" src="https://img.shields.io/badge/Chrome_Web_Store-published-blue">
-  <img alt="Version" src="https://img.shields.io/badge/version-1.4.0-blue">
+  <img alt="Version" src="https://img.shields.io/badge/version-1.5.0-blue">
   <img alt="Works with" src="https://img.shields.io/badge/works_with-Claude_Code_·_Hermes_·_Codex-8A2BE2">
 </p>
 
 ![Watch your AI drive Chrome: glowing border, real cursor, timestamped toasts](.github/media/hero.png)
 
-Claude Code and Hermes can already browse for you. LucidPilot makes that
+An AI clicking around inside your signed-in bank, email and work accounts is
+a genuinely uneasy thing to allow. LucidPilot's answer is to hide none of it.
+Claude Code and Hermes can already browse for you; LucidPilot makes that
 visible and keeps it under your control:
 
 - **You see everything.** A glowing border marks the driven tab, a real cursor
@@ -195,9 +197,36 @@ on by default. To turn it off:
 /lp default on   # back to redirecting them to my_browser_*
 ```
 
+### 4. (macOS) Control native apps
+
+On a Mac, LucidPilot can also drive your native apps: Mail, Xcode, Finder,
+Notes, Terminal, anything with no web version. Download the LucidPilot for Mac
+helper from the latest release, drag it to Applications, and launch it. On
+first run it asks for Accessibility (so it can read and click the app you
+choose) and, only if you want window screenshots or session replay, Screen
+Recording. Then allow the apps you want it to touch from its menu bar icon.
+
+Once the helper is running and you've allowed an app, your agent gets a second
+family of tools (`my_app_*`) alongside `my_browser_*`, and you can just name the
+app in a prompt:
+
+```
+Open Karabiner and set caps lock to escape on tap, control on hold
+Read the three articles open in Chrome, then DM the summary to Sarah in Slack
+```
+
+It works the same way the browser side does: a colored frame appears around the
+controlled window, a second cursor moves while your own stays yours, and control
+pauses the instant your mouse enters the window. Esc stops it. `/lp doctor`
+reports the helper's state next to the extension's.
+
+One thing to know for now: your licence is still activated in the Chrome
+extension popup, even if you only want app control. The helper reads that same
+licence through the bridge; there's no separate key to enter.
+
 ## What you get
 
-One licence unlocks everything - both halves, both integrations.
+One licence unlocks everything: both halves, all three integrations.
 
 | The overlay | The control engine |
 |---|---|
@@ -206,6 +235,11 @@ One licence unlocks everything - both halves, both integrations.
 | Action toasts, color-coded per agent | Navigate, wait, launch |
 | Local session log: 500 actions, timestamped | Snapshot, screenshot, find, inspect |
 | Flagged sensitive domains: agent fully blocked, red border | Console and network inspection |
+
+On macOS, the same overlay and control engine extend to native apps through the
+LucidPilot for Mac helper: 14 `my_app_*` tools (list, snapshot, click, type,
+fill, key, copy, paste, scroll, screenshot, menu) driving allowlisted apps over
+the accessibility API, with a chaptered mp4 replay of each session.
 
 ![Every action logged locally: 500 entries, timestamped, never leaves your device](.github/media/audit-log.png)
 
@@ -313,6 +347,8 @@ auth.py               Chrome-control gate: auto-grants on licence activation, /l
 licensing.py          Pro license gate: reads the verdict the extension
                      asserts to the bridge
 chrome_tools.py       the 21 my_browser_* tool handlers (gated on auth + license)
+app_tools.py          the 14 my_app_* tool handlers for native macOS apps
+                     (also gated on a connected LucidPilot for Mac helper)
 indicator_tools.py    the 6 indicator_* tools (cosmetic, licence-gated)
 commands.py           the /lp slash command
 mcp_server.py         MCP stdio server: the same tools + /lp for Claude Code,

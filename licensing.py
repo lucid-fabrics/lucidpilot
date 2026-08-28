@@ -133,6 +133,20 @@ def invalidate_status_cache() -> None:
         _memo_at = 0.0
 
 
+def _status_snapshot() -> Optional[dict]:
+    """Client-mode /status snapshot through the 2s memo (None when the owner
+    is unreachable; the None is memoized too, same as always, so a dead owner
+    doesn't get probed 46 times per tools listing)."""
+    global _memo, _memo_at
+    with _memo_lock:
+        if _memo is not None and (time.time() - _memo_at) < _STATUS_MEMO_TTL_S:
+            return _memo
+        status = _fetch_owner_status()
+        _memo = status
+        _memo_at = time.time()
+        return status
+
+
 def license_state() -> dict:
     """Structured licence snapshot {licensed, tier, licenseAssertedAt,
     licenseTokenState, licenseAssertedValid} - the same fields bridge.py's
@@ -142,14 +156,7 @@ def license_state() -> dict:
     b = _server_bridge()
     if b is not None:
         return b.license_fields()
-    global _memo, _memo_at
-    with _memo_lock:
-        if _memo is not None and (time.time() - _memo_at) < _STATUS_MEMO_TTL_S:
-            status = _memo
-        else:
-            status = _fetch_owner_status()
-            _memo = status
-            _memo_at = time.time()
+    status = _status_snapshot()
     if not status:
         return {
             "licensed": False,
@@ -166,6 +173,28 @@ def license_state() -> dict:
         # unlicensed messaging applies then, not the update-extension one.
         "licenseTokenState": status.get("licenseTokenState"),
         "licenseAssertedValid": status.get("licenseAssertedValid") is True,
+    }
+
+
+def helper_state() -> dict:
+    """{helperConnected, helperLastSeenAt, helper} - the owning bridge's
+    macOS-helper fields, however this process reaches it: server mode is a
+    pure in-memory read (bridge.helper_fields), client mode rides the same
+    memoized /status the licence reads use, so my_app_*'s check_fn adds zero
+    HTTP on the hot path. Slightly odd home for non-licence state, accepted
+    on purpose: this module owns the owning-bridge state read, licence and
+    otherwise - a second memo of the same endpoint would be worse."""
+    b = _server_bridge()
+    if b is not None:
+        return b.helper_fields()
+    status = _status_snapshot()
+    if not status:
+        return {"helperConnected": False, "helperLastSeenAt": None, "helper": None}
+    helper = status.get("helper")
+    return {
+        "helperConnected": status.get("helperConnected") is True,
+        "helperLastSeenAt": status.get("helperLastSeenAt"),
+        "helper": helper if isinstance(helper, dict) else None,
     }
 
 
@@ -254,6 +283,106 @@ def forget_legacy_license_key() -> None:
         pass
     except OSError:
         pass  # unreadable/undeletable file: migration will just retry next start
+
+
+_LICENSE_API = os.environ.get("LUCIDPILOT_LICENSE_API", "https://api.lucidfabrics.com").rstrip("/")
+_TICKET_TIMEOUT_S = 10.0
+
+
+def _session_token() -> Optional[str]:
+    """The raw server-signed session token this machine holds, or None.
+
+    Server mode reads it off the in-process bridge. Client mode asks the
+    owner's GET /license-token - the sibling that talks to the extension is
+    the only process that has one.
+    """
+    b = _server_bridge()
+    if b is not None:
+        try:
+            return b.license_token()
+        except Exception:
+            return None
+    try:
+        req = urllib_request.Request(f"{_bridge_url()}/license-token", method="GET")
+        with urllib_request.urlopen(req, timeout=_STATUS_TIMEOUT_S) as resp:
+            data = json.loads(resp.read().decode() or "{}")
+        token = data.get("token") if isinstance(data, dict) else None
+        return token if isinstance(token, str) and token else None
+    except (urllib_error.URLError, ConnectionError, OSError, ValueError):
+        return None
+
+
+def _request_ticket(payload: bytes) -> str:
+    """One POST to the licensing worker, or LicenseRequiredError with the cause."""
+    req = urllib_request.Request(
+        f"{_LICENSE_API}/api/licenses/relay-ticket",
+        data=payload,
+        # The UA matters: the default Python one trips Cloudflare's Browser
+        # Integrity Check at the edge (403 error 1010) before the worker runs.
+        headers={"content-type": "application/json", "user-agent": "LucidPilot-remote"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=_TICKET_TIMEOUT_S) as resp:
+            data = json.loads(resp.read().decode() or "{}")
+    except urllib_error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode() or "{}")
+        except Exception:  # noqa: BLE001
+            detail = {}
+        message = detail.get("error") if isinstance(detail, dict) else None
+        raise LicenseRequiredError(
+            "The licensing service refused to issue a relay ticket"
+            + (f": {message}" if message else f" (HTTP {exc.code})")
+            + ". If your licence looks fine in the popup, try again in a minute."
+        ) from None
+    except (urllib_error.URLError, ConnectionError, OSError, ValueError) as exc:
+        raise LicenseRequiredError(
+            f"Couldn't reach the licensing service to start a share ({exc}). "
+            "Check the connection and try again."
+        ) from None
+    ticket = data.get("ticket") if isinstance(data, dict) else None
+    if not isinstance(ticket, str) or not ticket:
+        raise LicenseRequiredError(
+            "The licensing service answered without a ticket. Try again in a "
+            "minute; if it keeps happening the service is misdeployed."
+        )
+    return ticket
+
+
+def relay_ticket(*, joining: bool = False) -> str:
+    """The ticket the relay demands, of the right tier for what is being done.
+
+    Two tiers, and which one this machine can get is the whole free/paid line:
+    an anonymous ticket may OPEN a channel and may not join one, so being helped
+    costs nothing and helping is what needs a licence.
+
+    ``joining`` says which end is asking, and it changes what a bad licence
+    means. Opening: nothing about being helped requires a licence, so a missing,
+    expired or unreadable token falls through to an anonymous ticket rather than
+    stopping somebody being helped over a billing problem they may not know they
+    have. Joining: a licence is the actual requirement, so the same failure is
+    reported rather than silently downgraded into a ticket that will be refused
+    at the relay with a message about tiers that means nothing to anybody.
+    """
+    token = _session_token()
+    if not token:
+        if joining:
+            raise LicenseRequiredError(
+                "Helping someone needs a verified licence, and this machine isn't "
+                "holding one right now. Open the extension popup and check the "
+                f"licence there, or run {_command_hint('doctor')}."
+            )
+        return _request_ticket(b"{}")
+
+    try:
+        return _request_ticket(json.dumps({"token": token}).encode())
+    except LicenseRequiredError:
+        if joining:
+            raise
+        # Being helped never required a licence, so a token this machine cannot
+        # cash in must not be the thing that stops it.
+        return _request_ticket(b"{}")
 
 
 if __name__ == "__main__":

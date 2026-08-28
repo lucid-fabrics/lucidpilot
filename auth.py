@@ -275,31 +275,41 @@ class ChromeAuth:
         """
         with self._lock:
             self._sync_if_changed()
-            until = self._authorized_until
-            now = time.time()
-            if until == _INDEFINITE:
-                # A licence auto-grant (_auto_granted) has no hard cap but DOES
-                # idle-lock: require_authorized stamps _last_used on every tool
-                # call, so active driving keeps the session alive and only true
-                # inactivity past IDLE_LOCK_S locks it (an abandoned session
-                # cannot keep driving). An explicit power-user opt-out
-                # (LUCIDPILOT_AUTO_AUTHORIZE=indefinite, or authorize
-                # 'indefinite'; _auto_granted False) keeps the original
-                # no-clocks meaning.
-                if self._auto_granted:
-                    return now - self._last_used <= IDLE_LOCK_S
-                return True
-            if isinstance(until, (int, float)) and until > now:
-                if now - self._last_used <= IDLE_LOCK_S:
-                    return True
-                # Idle-locked: grant still inside hard cap, but unused too long.
-                # Do NOT mutate - leave the grant for re-grant on next
-                # license assertion. (The next /lp tool call from the user
-                # will call require_authorized -> auto-extend, which stamps
-                # last_used and keeps the grant alive.)
-                return False
-            # Until is None or past the hard cap - locked.
-            return False
+            return self._is_live_locked()
+
+    def _is_live_locked(self) -> bool:
+        """Is the grant on record still doing anything? Caller holds _lock.
+
+        Extracted so that this and auto_authorize_from_license cannot disagree
+        about it, which is the whole reason it exists. They used to each decide
+        separately: this one refused a dead grant without clearing it, on the
+        stated grounds that the next licence assertion would re-grant, while
+        auto_authorize_from_license declined to re-grant whenever a grant
+        record existed at all. A dead record IS a record, so the assertion
+        arrived every minute and changed nothing, and /status printed the
+        contradiction out loud: authorized False, beside "authorized for
+        ~384m". One function owning the question closes that for good.
+        """
+        until = self._authorized_until
+        now = time.time()
+        if until == _INDEFINITE:
+            # A licence auto-grant (_auto_granted) has no hard cap but DOES
+            # idle-lock: require_authorized stamps _last_used on every tool
+            # call, so active driving keeps the session alive and only true
+            # inactivity past IDLE_LOCK_S locks it (an abandoned session
+            # cannot keep driving). An explicit power-user opt-out
+            # (LUCIDPILOT_AUTO_AUTHORIZE=indefinite, or authorize
+            # 'indefinite'; _auto_granted False) keeps the original
+            # no-clocks meaning.
+            if self._auto_granted:
+                return now - self._last_used <= IDLE_LOCK_S
+            return True
+        if isinstance(until, (int, float)) and until > now:
+            # Inside the hard cap. Idle still locks it, and the grant is left
+            # on record rather than cleared, for the next assertion to revive.
+            return now - self._last_used <= IDLE_LOCK_S
+        # Until is None, or the hard cap has passed. Locked either way.
+        return False
 
     def require_authorized(self) -> None:
         if not self.is_authorized():
@@ -458,8 +468,32 @@ class ChromeAuth:
                 # OR the user re-enables manually by editing auth.json.
                 if self._user_revoked:
                     return
-                if self._authorized_until is not None:
-                    return  # already granted - do not touch (operator-owned)
+                # A LIVE grant is left alone: it is the operator's, and a
+                # background assertion has no business touching it.
+                #
+                # A DEAD one is not left alone, and the question is decided by
+                # _is_live_locked() rather than by "is there a record", which
+                # is what deadlocked this before. A record whose hard cap has
+                # passed, or that has idle-locked, is still a record, so the
+                # old `is not None` test refused to re-grant precisely when
+                # re-granting was the only thing that could help. The extension
+                # asserted every minute and nothing happened, for ever.
+                #
+                # The first fix here only revived idle-locked AUTO grants,
+                # which was the wrong axis and left a real machine stuck: its
+                # grant was manual and had passed its hard cap three hours
+                # earlier, so it fell straight through the exception and
+                # stayed locked. Whether a dead grant was set by hand or by a
+                # licence does not change that it is dead, and nothing of the
+                # operator's intent survives in it to protect.
+                #
+                # Re-granting is not an override: their grant already ended on
+                # its own terms, the licence is still valid, and by this
+                # design's own words licence activation IS the consent moment.
+                # It is also exactly what deactivate-and-reactivate does today,
+                # which is the ritual users had to learn instead.
+                if self._authorized_until is not None and self._is_live_locked():
+                    return
                 self._authorized_until = _INDEFINITE
                 self._last_used = time.time()
                 self._auto_granted = True
@@ -475,6 +509,23 @@ class ChromeAuth:
             self._auto_granted = False
             self._user_revoked = False
             self._persist()
+
+    def user_revoked(self) -> bool:
+        """Did the user explicitly lock control, as opposed to never unlocking it?
+
+        The distinction matters because remote assist is free and local control
+        is not. On a machine that never had a licence there is simply no grant,
+        so is_authorized() is False for ever - and if that were the only question
+        asked, a free requester could never be helped at all. "The user pressed
+        revoke" is a different fact from "this machine was never licensed", and
+        only the first should stop a helper who is already in a verified session.
+
+        Same pure-read discipline as is_authorized: syncs a sibling process's
+        change into memory, never writes.
+        """
+        with self._lock:
+            self._sync_if_changed()
+            return self._user_revoked
 
     def revoke(self) -> str:
         with self._lock:

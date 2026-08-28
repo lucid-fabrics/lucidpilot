@@ -1,11 +1,15 @@
 name: lucidpilot
-version: "1.4.0"
+version: "1.5.0"
 description: >-
   Drives the user's real, signed-in Chrome profile through LucidPilot's own
   companion Chrome extension over a loopback bridge (port 16329 by default):
   tabs, accessibility snapshot, navigation, interaction (click/type/fill/
   key/hover/drag/scroll/tap), file upload, screenshots, and console/network
-  observation via the my_browser_* tools. Locked by default, unlocked
+  observation via the my_browser_* tools. On a Mac with the LucidPilot
+  helper app running, the my_app_* tools additionally drive native macOS
+  apps the user has allowlisted (accessibility snapshot, click/type/fill/
+  key/copy/paste/scroll, window screenshots, menu commands) with the same
+  visible overlay. Locked by default, unlocked
   automatically by licence activation in the extension popup (/lp revoke
   re-locks). Also shows a blue/violet border, mouse-like cursor,
   target-element highlights, and an action toast in that same Chrome while
@@ -43,6 +47,20 @@ provides_tools:
   - my_browser_tap
   - my_browser_scroll
   - my_browser_upload_file
+  - my_app_list
+  - my_app_activate
+  - my_app_snapshot
+  - my_app_click
+  - my_app_type
+  - my_app_fill
+  - my_app_key
+  - my_app_copy
+  - my_app_paste
+  - my_app_scroll
+  - my_app_drag
+  - my_app_screenshot
+  - my_app_wait_for
+  - my_app_menu
   - indicator_show
   - indicator_hide
   - indicator_move

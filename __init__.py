@@ -97,6 +97,24 @@ Usage rules:
 my_browser_* actions paint the AI Session Indicator overlay (border/cursor/toast) automatically as part of LucidPilot's own extension; no separate indicator_* call is needed for them.
 </lucidpilot>"""
 
+# Injected only when the Mac helper is actually connected - priming the model
+# about tools it cannot see would just invite failed calls (same gating logic
+# as _CONTROL_PRIMER's auth check). Kept in step with the my_app_* paragraph
+# of mcp_server.SERVER_INSTRUCTIONS.
+_APP_PRIMER = """\
+<lucidpilot-mac>
+The LucidPilot for Mac helper is connected: my_app_* tools drive native macOS apps (Mail, Xcode, Finder, Notes, Terminal, ...) the same visible way my_browser_* drives Chrome - frame, second cursor, toast.
+
+Choosing between the families: anything that lives in a browser - including a web app in an app-shaped window - is my_browser_*. Native Mac apps are my_app_*. "Open the invoice page" is the browser; "attach it to a new Mail draft" is the app.
+
+my_app_* only works on apps the user has allowlisted in the helper's menu bar UI. An app marked "NOT granted" in my_app_list, or a consent error, means the USER must allow it there - the agent cannot grant it; ask, then retry.
+
+Usage rules:
+1. Start with my_app_list, then my_app_snapshot for element uids; act by uid.
+2. Prefer my_app_fill for text (no keyboard, works on background apps, immune to secure input) and my_app_menu for app commands (Save, Export, ...) - both work without focusing the app.
+3. The user's mouse entering the controlled window pauses control; Esc stops it. Errors say so - report them, don't retry blindly.
+</lucidpilot-mac>"""
+
 
 def _control_tools_mode() -> str:
     """Read the control_tools knob: "auto" (default) | "always" | "never".
@@ -160,6 +178,7 @@ def register(ctx) -> None:
         import atexit
 
         from . import licensing, redirect_policy
+        from .app_tools import register_all_tools as _register_app_tools
         from .auth import ChromeAuth, command_hint
         from .bridge import ChromeProfileBridge
         from .chrome_tools import register_all_tools as _register_browser_tools
@@ -199,6 +218,11 @@ def register(ctx) -> None:
 
         if register_control:
             _register_browser_tools(ctx, bridge, auth)
+            # my_app_* rides the same control_tools knob as my_browser_* (so
+            # control_tools=never hides BOTH families): auth and bridge are
+            # only constructed in this block, and there is no rival native
+            # app-control family for "auto" to de-duplicate against anyway.
+            _register_app_tools(ctx, bridge, auth)
             register_all_commands(ctx, bridge, auth)
 
             # Cleanup: stop the bridge when the owning Python process exits. Not
@@ -228,6 +252,11 @@ def register(ctx) -> None:
         parts = [_INDICATOR_PRIMER]
         if auth is not None and auth.is_authorized():
             parts.append(_CONTROL_PRIMER)
+            try:
+                if licensing.helper_state()["helperConnected"]:
+                    parts.append(_APP_PRIMER)
+            except Exception:
+                pass  # a broken status probe must not break the turn
         return {"context": "\n\n".join(parts)}
 
     ctx.register_hook("pre_llm_call", _inject_primer)
